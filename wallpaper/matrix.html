@@ -19,11 +19,18 @@
 (function () {
   // ---- tunables ---------------------------------------------------------
   const FRAME_MS   = 50;     // higher = slower animation (~20 fps)
-  const SPEED_MIN  = 0.45;   // rows advanced per frame (lower = slower fall)
-  const SPEED_MAX  = 0.95;
-  const DECAY      = 0.975;   // trail fade per frame (higher = longer tails)
-  const GLITCH_GLOW = 0.9;    // brightness a flipped glyph jumps back to (glows again)
-  const GLITCH_RATE = 0.0020; // fraction of cells that flip glyph per frame
+  const SPEED_MIN  = 0.55;   // rows advanced per frame (lower = slower fall)
+  const SPEED_MAX  = 1.10;
+  const DECAY      = 0.96;    // trail fade per frame (higher = longer tails)
+  const FLASH_BOOST = 0.5;    // momentary extra glow when a glyph changes/flips
+  const FLASH_DECAY = 0.45;   // how fast that flash fades (low = brief); base tail fade unchanged
+  const CHANGE_CHANCE = 0.10; // per-frame chance a lit trailing glyph silently morphs (constant churn)
+  const GLITCH_RATE = 0.0020; // fraction of cells that change glyph WITH a flash (emphasis)
+  const FLIP_RATE   = 0.0015; // fraction of cells mirrored horizontally per frame
+  const FLIP_CHANCE = 0.28;   // chance a freshly-lit glyph spawns mirrored
+  const INTERRUPT_CHANCE = 0.004; // per-frame chance a whole column is wiped & restarted ("being edited")
+  const SEG_ERASE_RATE = 0.06;  // segment-erase attempts per column per frame (punches gaps in streams)
+  const SEG_MIN = 5, SEG_MAX = 20; // erased segment length range (cells)
   const RESTART_GAP = 22;     // how far above the top a finished column restarts
   // -----------------------------------------------------------------------
 
@@ -32,11 +39,11 @@
 
   const codes = [];
   for (let c = 0xFF66; c <= 0xFF9D; c++) codes.push(c);                 // katakana
-  for (const ch of "0123456789:.=*+-<>|") codes.push(ch.charCodeAt(0));
+  for (const ch of "0123456789*+-/<>=:;.?!^|()[]{}~") codes.push(ch.charCodeAt(0));
   const code = () => codes[(Math.random() * codes.length) | 0];
 
   let W, H, fontSize, cellW, cellH, cols, rows;
-  let bright, chars, head, speed, prevRow;
+  let bright, chars, flip, flash, head, speed, prevRow;
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -59,6 +66,8 @@
 
     bright  = new Float32Array(cols * rows);
     chars   = new Uint16Array(cols * rows);
+    flip    = new Uint8Array(cols * rows);
+    flash   = new Float32Array(cols * rows);
     head    = new Float32Array(cols);
     speed   = new Float32Array(cols);
     prevRow = new Int32Array(cols);
@@ -76,7 +85,12 @@
 
   function step() {
     // 1) fade every cell a little (trail keeps its character, just dims)
-    for (let i = 0; i < bright.length; i++) if (bright[i] > 0.001) bright[i] *= DECAY;
+    for (let i = 0; i < bright.length; i++) {
+      if (bright[i] > 0.001) bright[i] *= DECAY;
+      flash[i] = (flash[i] > 0.001) ? flash[i] * FLASH_DECAY : 0;
+      // constantly cycle visible trailing glyphs (no flash) -- the "always changing" look
+      if (bright[i] > 0.12 && Math.random() < CHANGE_CHANCE) chars[i] = code();
+    }
 
     // 2) advance each column's head, lighting new cells with fresh glyphs
     for (let c = 0; c < cols; c++) {
@@ -87,6 +101,7 @@
           if (r >= 0 && r < rows) {
             const idx = c * rows + r;
             chars[idx] = code();
+            flip[idx] = (Math.random() < FLIP_CHANCE) ? 1 : 0;
             bright[idx] = 1.0;
           }
         }
@@ -96,14 +111,40 @@
         head[c] = -((Math.random() * RESTART_GAP) | 0);
         prevRow[c] = Math.floor(head[c]);
         speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+      } else if (Math.random() < INTERRUPT_CHANCE) {
+        // "being edited": wipe this stream, then replace it -- half the time a
+        // fresh stream from the top (renewal), half a mid-screen reappearance (edit).
+        for (let r = 0; r < rows; r++) { const idx = c * rows + r; bright[idx] = 0; flash[idx] = 0; }
+        head[c] = (Math.random() < 0.5) ? -Math.random() * RESTART_GAP : Math.random() * rows;
+        prevRow[c] = Math.floor(head[c]);
+        speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
       }
     }
 
-    // 3) flicker: flip a few random lit cells to a new glyph (authentic churn)
+    // 3) flicker: change a few random lit cells to a new glyph (authentic churn)
     const glitches = Math.max(1, (cols * rows * GLITCH_RATE) | 0);
     for (let k = 0; k < glitches; k++) {
       const idx = (Math.random() * bright.length) | 0;
-      if (bright[idx] > 0.15) { chars[idx] = code(); bright[idx] = Math.max(bright[idx], GLITCH_GLOW); }
+      if (bright[idx] > 0.15) { chars[idx] = code(); flash[idx] = FLASH_BOOST; }
+    }
+
+    // 4) ...and mirror a few other random lit cells horizontally
+    const flips = Math.max(1, (cols * rows * FLIP_RATE) | 0);
+    for (let k = 0; k < flips; k++) {
+      const idx = (Math.random() * bright.length) | 0;
+      if (bright[idx] > 0.15) { flip[idx] ^= 1; flash[idx] = FLASH_BOOST; }
+    }
+
+    // 6) ...and punch short gaps into random lit streams ("sections taken out")
+    const segErases = Math.max(1, (cols * SEG_ERASE_RATE) | 0);
+    for (let k = 0; k < segErases; k++) {
+      const idx = (Math.random() * bright.length) | 0;
+      if (bright[idx] > 0.2) {
+        const base = ((idx / rows) | 0) * rows;
+        const r0 = idx % rows;
+        const len = SEG_MIN + ((Math.random() * (SEG_MAX - SEG_MIN + 1)) | 0);
+        for (let r = r0; r < r0 + len && r < rows; r++) { bright[base + r] = 0; flash[base + r] = 0; }
+      }
     }
   }
 
@@ -115,11 +156,24 @@
       const x = c * cellW;
       const base = c * rows;
       for (let r = 0; r < rows; r++) {
-        const b = bright[base + r];
+        let b = bright[base + r] + flash[base + r];
         if (b <= 0.04) continue;
-        if (b > 0.85) ctx.fillStyle = 'rgba(200,255,210,' + Math.min(1, b) + ')'; // head
-        else ctx.fillStyle = 'rgba(0,255,70,' + b + ')';                          // trail
-        ctx.fillText(String.fromCharCode(chars[base + r]), x, r * cellH);
+        if (b > 1) b = 1;
+        // gradient: pure-white head -> matrix green -> black tail
+        let cr, cg, cb;
+        if (b >= 0.8) { const t = (b - 0.8) / 0.2; cr = (255 * t) | 0; cg = 255; cb = (70 + 185 * t) | 0; }
+        else { const t = b / 0.8; cr = 0; cg = (255 * t) | 0; cb = (70 * t) | 0; }
+        ctx.fillStyle = 'rgb(' + cr + ',' + cg + ',' + cb + ')';
+        const ch = String.fromCharCode(chars[base + r]);
+        if (flip[base + r]) {
+          ctx.save();
+          ctx.translate(x + cellW, r * cellH);
+          ctx.scale(-1, 1);
+          ctx.fillText(ch, 0, 0);
+          ctx.restore();
+        } else {
+          ctx.fillText(ch, x, r * cellH);
+        }
       }
     }
   }

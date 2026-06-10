@@ -165,7 +165,7 @@ namespace MatrixScreensaver
             // Strategy 1 (Win10 classic): the desktop-sized WorkerW sibling that
             // sits *after* the window hosting SHELLDLL_DefView.
             IntPtr workerw = IntPtr.Zero;
-            EnumWindows(delegate(IntPtr top, IntPtr lp)
+            EnumWindows(delegate (IntPtr top, IntPtr lp)
             {
                 if (FindWindowEx(top, IntPtr.Zero, "SHELLDLL_DefView", null) != IntPtr.Zero)
                 {
@@ -201,30 +201,40 @@ namespace MatrixScreensaver
     // Mirrors wallpaper/matrix.html.
     class RainField
     {
-        const float DECAY = 0.975f;          // trail fade per step (higher = longer tails)
-        const float SPEED_MIN = 0.45f, SPEED_MAX = 0.95f; // rows per step
-        const double GLITCH_RATE = 0.0020;   // fraction of cells that flip glyph per step
-        const float GLITCH_GLOW = 0.9f;      // brightness a flipped glyph jumps back to
+        const float DECAY = 0.96f;           // trail fade per step (higher = longer tails)
+        const float SPEED_MIN = 0.55f, SPEED_MAX = 1.10f; // rows per step
+        const double CHANGE_CHANCE = 0.10;   // per-step chance a lit trailing glyph silently morphs (constant churn)
+        const double GLITCH_RATE = 0.0020;   // fraction of cells that change glyph WITH a flash (emphasis pops)
+        const float FLASH_BOOST = 0.5f;      // momentary extra glow when a glyph changes/flips
+        const float FLASH_DECAY = 0.45f;     // how fast that flash fades (low = brief); base tail fade is unchanged
+        const double FLIP_RATE = 0.0015;     // fraction of cells mirrored horizontally per step
+        const float FLIP_CHANCE = 0.28f;     // chance a freshly-lit glyph spawns mirrored
+        const double INTERRUPT_CHANCE = 0.004; // per-step chance a whole column is wiped & restarted ("being edited")
+        const double SEG_ERASE_RATE = 0.06;  // segment-erase attempts per column per step (punches gaps in streams)
+        const int SEG_MIN = 5, SEG_MAX = 20; // erased segment length range (cells)
         const int RESTART_GAP = 22;          // how far above the top a finished column restarts
-        const int LEVELS = 24;               // brightness quantization for the glyph cache
+        const int LEVELS = 48;               // brightness quantization for the glyph cache (smooth gradient)
 
         public readonly Font Font;
         public readonly int CellW, CellH, Cols, Rows;
         public readonly float[] Bright;
         public readonly int[] Chars;         // glyph index per cell
+        public readonly bool[] Flip;         // drawn horizontally mirrored?
+        public readonly float[] Flash;       // momentary glow on change/flip; fades fast, separate from the tail
 
         readonly float[] head;
         readonly float[] speed;
         readonly int[] prevRow;
         readonly Random rnd = new Random();
         readonly Bitmap[,] cache;            // [glyph, level]; level LEVELS == bright head
+        readonly Bitmap[,] cacheFlipped;     // same, mirrored horizontally
 
         static readonly char[] Glyphs = BuildGlyphs();
         static char[] BuildGlyphs()
         {
             List<char> g = new List<char>();
             for (int c = 0xFF66; c <= 0xFF9D; c++) g.Add((char)c); // half-width katakana
-            foreach (char ch in "0123456789:.=*+-<>|") g.Add(ch);
+            foreach (char ch in "0123456789*+-/<>=:;.?!^|()[]{}~") g.Add(ch);
             return g.ToArray();
         }
 
@@ -246,6 +256,8 @@ namespace MatrixScreensaver
 
             Bright = new float[Cols * Rows];
             Chars = new int[Cols * Rows];
+            Flip = new bool[Cols * Rows];
+            Flash = new float[Cols * Rows];
             head = new float[Cols];
             speed = new float[Cols];
             prevRow = new int[Cols];
@@ -269,26 +281,45 @@ namespace MatrixScreensaver
                     {
                         g.Clear(Color.Black);
                         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                        Color col = (l == LEVELS)
-                            ? Color.FromArgb(205, 255, 215)
-                            : Color.FromArgb(0, (int)(255f * (l + 1) / LEVELS), (int)(70f * (l + 1) / LEVELS));
+                        // gradient: pure-white head -> matrix green -> black tail
+                        float bb = l / (float)LEVELS;
+                        int cr, cg, cb;
+                        if (bb >= 0.8f) { float t = (bb - 0.8f) / 0.2f; cr = (int)(255 * t); cg = 255; cb = (int)(70 + 185 * t); }
+                        else { float t = bb / 0.8f; cr = 0; cg = (int)(255 * t); cb = (int)(70 * t); }
+                        Color col = Color.FromArgb(cr, cg, cb);
                         using (SolidBrush br = new SolidBrush(col))
                             g.DrawString(Glyphs[gi].ToString(), Font, br, 0, 0, StringFormat.GenericTypographic);
                     }
                     cache[gi, l] = bm;
                 }
+
+            // Mirrored copies for the horizontal-flip effect.
+            cacheFlipped = new Bitmap[Glyphs.Length, LEVELS + 1];
+            for (int gi = 0; gi < Glyphs.Length; gi++)
+                for (int l = 0; l <= LEVELS; l++)
+                {
+                    Bitmap bm = (Bitmap)cache[gi, l].Clone();
+                    bm.RotateFlip(RotateFlipType.RotateNoneFlipX);
+                    cacheFlipped[gi, l] = bm;
+                }
         }
 
-        public Bitmap Tile(int glyphIdx, float b)
+        public Bitmap Tile(int glyphIdx, float b, bool flipped)
         {
-            int l = (b > 0.85f) ? LEVELS : (int)(b * LEVELS);
+            int l = (int)(b * LEVELS + 0.5f);
             if (l < 0) l = 0; else if (l > LEVELS) l = LEVELS;
-            return cache[glyphIdx, l];
+            return flipped ? cacheFlipped[glyphIdx, l] : cache[glyphIdx, l];
         }
 
         public void Step()
         {
-            for (int i = 0; i < Bright.Length; i++) if (Bright[i] > 0.001f) Bright[i] *= DECAY;
+            for (int i = 0; i < Bright.Length; i++)
+            {
+                if (Bright[i] > 0.001f) Bright[i] *= DECAY;
+                if (Flash[i] > 0.001f) Flash[i] *= FLASH_DECAY; else Flash[i] = 0f;
+                // constantly cycle visible trailing glyphs (no flash) -- the "always changing" look
+                if (Bright[i] > 0.12f && rnd.NextDouble() < CHANGE_CHANCE) Chars[i] = GlyphIdx();
+            }
 
             for (int c = 0; c < Cols; c++)
             {
@@ -297,12 +328,21 @@ namespace MatrixScreensaver
                 if (nr != prevRow[c])
                 {
                     for (int r = prevRow[c] + 1; r <= nr; r++)
-                        if (r >= 0 && r < Rows) { int idx = c * Rows + r; Chars[idx] = GlyphIdx(); Bright[idx] = 1f; }
+                        if (r >= 0 && r < Rows) { int idx = c * Rows + r; Chars[idx] = GlyphIdx(); Flip[idx] = rnd.NextDouble() < FLIP_CHANCE; Bright[idx] = 1f; }
                     prevRow[c] = nr;
                 }
                 if (head[c] > Rows + 6)
                 {
                     head[c] = -rnd.Next(RESTART_GAP);
+                    prevRow[c] = (int)Math.Floor(head[c]);
+                    speed[c] = RandSpeed();
+                }
+                else if (rnd.NextDouble() < INTERRUPT_CHANCE)
+                {
+                    // "being edited": wipe this stream, then replace it -- half the time a
+                    // fresh stream from the top (renewal), half a mid-screen reappearance (edit).
+                    for (int r = 0; r < Rows; r++) { int idx = c * Rows + r; Bright[idx] = 0f; Flash[idx] = 0f; }
+                    head[c] = (rnd.NextDouble() < 0.5) ? -(float)(rnd.NextDouble() * RESTART_GAP) : (float)(rnd.NextDouble() * Rows);
                     prevRow[c] = (int)Math.Floor(head[c]);
                     speed[c] = RandSpeed();
                 }
@@ -312,7 +352,29 @@ namespace MatrixScreensaver
             for (int k = 0; k < glitches; k++)
             {
                 int idx = rnd.Next(Bright.Length);
-                if (Bright[idx] > 0.15f) { Chars[idx] = GlyphIdx(); if (Bright[idx] < GLITCH_GLOW) Bright[idx] = GLITCH_GLOW; }
+                if (Bright[idx] > 0.15f) { Chars[idx] = GlyphIdx(); Flash[idx] = FLASH_BOOST; }
+            }
+
+            // ...and separately, mirror some other random lit cells horizontally.
+            int flips = Math.Max(1, (int)(Cols * Rows * FLIP_RATE));
+            for (int k = 0; k < flips; k++)
+            {
+                int idx = rnd.Next(Bright.Length);
+                if (Bright[idx] > 0.15f) { Flip[idx] = !Flip[idx]; Flash[idx] = FLASH_BOOST; }
+            }
+
+            // ...and punch short gaps into random lit streams ("sections taken out").
+            int segErases = Math.Max(1, (int)(Cols * SEG_ERASE_RATE));
+            for (int k = 0; k < segErases; k++)
+            {
+                int idx = rnd.Next(Bright.Length);
+                if (Bright[idx] > 0.2f)
+                {
+                    int baseIdx = (idx / Rows) * Rows;
+                    int r0 = idx % Rows;
+                    int len = SEG_MIN + rnd.Next(SEG_MAX - SEG_MIN + 1);
+                    for (int r = r0; r < r0 + len && r < Rows; r++) { Bright[baseIdx + r] = 0f; Flash[baseIdx + r] = 0f; }
+                }
             }
         }
     }
@@ -471,9 +533,10 @@ namespace MatrixScreensaver
                 int baseIdx = c * field.Rows;
                 for (int r = rStart; r <= rEnd; r++)
                 {
-                    float b = field.Bright[baseIdx + r];
+                    float b = field.Bright[baseIdx + r] + field.Flash[baseIdx + r];
                     if (b <= 0.04f) continue;
-                    gBuf.DrawImageUnscaled(field.Tile(field.Chars[baseIdx + r], b), lx, r * field.CellH - offsetY);
+                    if (b > 1f) b = 1f;
+                    gBuf.DrawImageUnscaled(field.Tile(field.Chars[baseIdx + r], b, field.Flip[baseIdx + r]), lx, r * field.CellH - offsetY);
                 }
             }
 
