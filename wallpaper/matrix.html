@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Matrix</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  #c { display: block; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Matrix "digital rain". Each grid cell keeps its OWN character and brightness:
+// the leading head is near-white, the trail behind it is the SAME characters
+// fading to green, and occasionally a random cell flips to a new glyph (the
+// authentic flicker). Works as a Lively HTML wallpaper, incl. spanned displays.
+(function () {
+  // ---- tunables ---------------------------------------------------------
+  const FRAME_MS   = 50;     // higher = slower animation (~20 fps)
+  const SPEED_MIN  = 0.45;   // rows advanced per frame (lower = slower fall)
+  const SPEED_MAX  = 0.95;
+  const DECAY      = 0.975;   // trail fade per frame (higher = longer tails)
+  const GLITCH_GLOW = 0.9;    // brightness a flipped glyph jumps back to (glows again)
+  const GLITCH_RATE = 0.0020; // fraction of cells that flip glyph per frame
+  const RESTART_GAP = 22;     // how far above the top a finished column restarts
+  // -----------------------------------------------------------------------
+
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d', { alpha: false });
+
+  const codes = [];
+  for (let c = 0xFF66; c <= 0xFF9D; c++) codes.push(c);                 // katakana
+  for (const ch of "0123456789:.=*+-<>|") codes.push(ch.charCodeAt(0));
+  const code = () => codes[(Math.random() * codes.length) | 0];
+
+  let W, H, fontSize, cellW, cellH, cols, rows;
+  let bright, chars, head, speed, prevRow;
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    W = canvas.width = Math.floor(window.innerWidth * dpr);
+    H = canvas.height = Math.floor(window.innerHeight * dpr);
+    canvas.style.width = window.innerWidth + 'px';
+    canvas.style.height = window.innerHeight + 'px';
+
+    // Glyph size keyed to a single monitor's height, so it looks the same
+    // whether Lively runs us per-monitor or spanned across all displays.
+    const refH = ((window.screen && window.screen.height) ? window.screen.height : 1080) * dpr;
+    fontSize = Math.max(14, Math.floor(refH / 55));
+    ctx.font = "bold " + fontSize + "px 'MS Gothic','Yu Gothic',monospace";
+    ctx.textBaseline = 'top';
+    cellW = Math.max(6, Math.ceil(ctx.measureText('ｴ').width));
+    cellH = Math.ceil(fontSize * 1.05);
+
+    cols = Math.max(1, Math.floor(W / cellW));
+    rows = Math.max(1, Math.floor(H / cellH) + 1);
+
+    bright  = new Float32Array(cols * rows);
+    chars   = new Uint16Array(cols * rows);
+    head    = new Float32Array(cols);
+    speed   = new Float32Array(cols);
+    prevRow = new Int32Array(cols);
+    for (let c = 0; c < cols; c++) {
+      head[c] = -Math.random() * rows;
+      speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+      prevRow[c] = Math.floor(head[c]);
+    }
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  window.addEventListener('resize', resize);
+  resize();
+
+  function step() {
+    // 1) fade every cell a little (trail keeps its character, just dims)
+    for (let i = 0; i < bright.length; i++) if (bright[i] > 0.001) bright[i] *= DECAY;
+
+    // 2) advance each column's head, lighting new cells with fresh glyphs
+    for (let c = 0; c < cols; c++) {
+      head[c] += speed[c];
+      const nr = Math.floor(head[c]);
+      if (nr !== prevRow[c]) {
+        for (let r = prevRow[c] + 1; r <= nr; r++) {
+          if (r >= 0 && r < rows) {
+            const idx = c * rows + r;
+            chars[idx] = code();
+            bright[idx] = 1.0;
+          }
+        }
+        prevRow[c] = nr;
+      }
+      if (head[c] > rows + 6) {
+        head[c] = -((Math.random() * RESTART_GAP) | 0);
+        prevRow[c] = Math.floor(head[c]);
+        speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+      }
+    }
+
+    // 3) flicker: flip a few random lit cells to a new glyph (authentic churn)
+    const glitches = Math.max(1, (cols * rows * GLITCH_RATE) | 0);
+    for (let k = 0; k < glitches; k++) {
+      const idx = (Math.random() * bright.length) | 0;
+      if (bright[idx] > 0.15) { chars[idx] = code(); bright[idx] = Math.max(bright[idx], GLITCH_GLOW); }
+    }
+  }
+
+  function render() {
+    ctx.fillStyle = '#000';
+    ctx.fillRect(0, 0, W, H);
+    ctx.font = "bold " + fontSize + "px 'MS Gothic','Yu Gothic',monospace";
+    for (let c = 0; c < cols; c++) {
+      const x = c * cellW;
+      const base = c * rows;
+      for (let r = 0; r < rows; r++) {
+        const b = bright[base + r];
+        if (b <= 0.04) continue;
+        if (b > 0.85) ctx.fillStyle = 'rgba(200,255,210,' + Math.min(1, b) + ')'; // head
+        else ctx.fillStyle = 'rgba(0,255,70,' + b + ')';                          // trail
+        ctx.fillText(String.fromCharCode(chars[base + r]), x, r * cellH);
+      }
+    }
+  }
+
+  let last = 0;
+  function loop(t) {
+    requestAnimationFrame(loop);
+    if (t - last < FRAME_MS) return;
+    last = t;
+    step();
+    render();
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

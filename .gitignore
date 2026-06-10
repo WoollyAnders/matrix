@@ -1,0 +1,4 @@
+# Build output (regenerate with ./build.sh)
+*.scr
+*.exe
+*.pdb
