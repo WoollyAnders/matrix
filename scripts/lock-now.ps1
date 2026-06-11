@@ -7,13 +7,15 @@
   monitors, and when you come back and move the mouse / press a key it locks
   the workstation -- Windows then asks for your password.
 
-  (We launch it directly rather than via the system screensaver path, because
+  We launch it directly rather than via the system screensaver path, because
   Windows' own screensaver monitor would kill it the instant the launching
-  keystroke arrives.)
+  keystroke arrives. We also launch the .exe (not the .scr): running a .scr via
+  ShellExecute drops custom arguments, so /lock would be lost and it would fall
+  back to plain screensaver mode without locking.
 #>
 [CmdletBinding()]
 param()
 
-$scr = Join-Path $env:USERPROFILE 'Matrix\Matrix.scr'
-if (-not (Test-Path $scr)) { throw "Matrix.scr not found. Run scripts\install.ps1 first." }
-Start-Process -FilePath $scr -ArgumentList '/lock'
+$exe = Join-Path $env:USERPROFILE 'Matrix\Matrix.exe'
+if (-not (Test-Path $exe)) { throw "Matrix.exe not found. Run scripts\install.ps1 first." }
+Start-Process -FilePath $exe -ArgumentList '/lock'

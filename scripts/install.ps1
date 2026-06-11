@@ -30,6 +30,10 @@ $dest = Join-Path $destDir 'Matrix.scr'
 Copy-Item -Force -Path $source -Destination $dest
 Write-Host "Copied screensaver -> $dest"
 
+# Also deploy the .exe build (used by the lock hotkey, which needs /lock to pass).
+$exeSrc = Join-Path $PSScriptRoot '..\Matrix.exe'
+if (Test-Path $exeSrc) { Copy-Item -Force -Path (Resolve-Path $exeSrc).Path -Destination (Join-Path $destDir 'Matrix.exe') }
+
 $desk = 'HKCU:\Control Panel\Desktop'
 Set-ItemProperty -Path $desk -Name 'SCRNSAVE.EXE'        -Value $dest
 Set-ItemProperty -Path $desk -Name 'ScreenSaveActive'    -Value '1'

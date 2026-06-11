@@ -202,7 +202,7 @@ namespace MatrixScreensaver
     class RainField
     {
         const float DECAY = 0.96f;           // trail fade per step (higher = longer tails)
-        const float SPEED_MIN = 0.55f, SPEED_MAX = 1.10f; // rows per step
+        const float SPEED_MIN = 0.45f, SPEED_MAX = 1.0f; // rows per step
         const double CHANGE_CHANCE = 0.10;   // per-step chance a lit trailing glyph silently morphs (constant churn)
         const double GLITCH_RATE = 0.0020;   // fraction of cells that change glyph WITH a flash (emphasis pops)
         const float FLASH_BOOST = 0.5f;      // momentary extra glow when a glyph changes/flips
@@ -559,11 +559,22 @@ namespace MatrixScreensaver
             if (Math.Abs(p.X - armCursor.X) > 8 || Math.Abs(p.Y - armCursor.Y) > 8) Dismiss();
         }
 
+        static bool dismissing;
         void Dismiss()
         {
-            // In /lock mode, lock the workstation as we go away -> password on return.
-            if (lockOnExit) { try { LockWorkStation(); } catch { } }
-            Application.Exit();
+            if (dismissing) return;
+            dismissing = true;
+            if (lockOnExit)
+            {
+                // Lock the workstation as we go away -> password on return.
+                try { LockWorkStation(); } catch { }
+                // Give Winlogon a moment to switch to the secure desktop before we tear down.
+                Timer t = new Timer();
+                t.Interval = 600;
+                t.Tick += delegate { t.Stop(); t.Dispose(); Application.Exit(); };
+                t.Start();
+            }
+            else Application.Exit();
         }
 
         protected override void Dispose(bool disposing)

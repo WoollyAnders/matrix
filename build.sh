@@ -29,3 +29,9 @@ echo "Built: $OUT"
 WALL="$HERE/MatrixWallpaper.exe"
 cp -f "$OUT" "$WALL"
 echo "Built: $WALL"
+
+# Same binary as a .exe for the lock hotkey: launching the .scr via ShellExecute
+# drops custom args (so /lock is lost), but a .exe receives them normally.
+EXE="$HERE/Matrix.exe"
+cp -f "$OUT" "$EXE"
+echo "Built: $EXE"

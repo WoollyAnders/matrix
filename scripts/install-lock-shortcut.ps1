@@ -23,6 +23,11 @@ $lockSrc = Join-Path $PSScriptRoot 'lock-now.ps1'
 $lockDst = Join-Path $installDir 'lock-now.ps1'
 Copy-Item -Force -Path $lockSrc -Destination $lockDst
 
+# The hotkey launches Matrix.exe /lock (a .scr would drop the /lock arg), so make
+# sure the .exe is deployed.
+$exeSrc = Join-Path $PSScriptRoot '..\Matrix.exe'
+if (Test-Path $exeSrc) { Copy-Item -Force -Path (Resolve-Path $exeSrc).Path -Destination (Join-Path $installDir 'Matrix.exe') }
+
 $powershell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
 $desktop    = [Environment]::GetFolderPath('Desktop')
 $lnkPath    = Join-Path $desktop 'Lock with Matrix.lnk'
