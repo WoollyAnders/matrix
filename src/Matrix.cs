@@ -210,8 +210,16 @@ namespace MatrixScreensaver
         const double FLIP_RATE = 0.0015;     // fraction of cells mirrored horizontally per step
         const float FLIP_CHANCE = 0.28f;     // chance a freshly-lit glyph spawns mirrored
         const double INTERRUPT_CHANCE = 0.004; // per-step chance a whole column is wiped & restarted ("being edited")
-        const double SEG_ERASE_RATE = 0.06;  // segment-erase attempts per column per step (punches gaps in streams)
-        const int SEG_MIN = 5, SEG_MAX = 20; // erased segment length range (cells)
+        // "being edited": each erase punches a gap of a RANDOM scale into a lit stream --
+        // mostly a few stray characters, sometimes a segment, occasionally a long chunk
+        // (a whole-column wipe is the separate INTERRUPT_CHANCE above).
+        const double SEG_ERASE_RATE = 0.12;  // erase attempts per column per step
+        const double SEG_SMALL_FRAC = 0.65;  // share of erases that nibble just a few chars
+        const double SEG_MED_FRAC = 0.27;    // share that take out a mid-size segment (rest = long chunk)
+        const int SEG_SMALL_MIN = 1, SEG_SMALL_MAX = 3;
+        const int SEG_MED_MIN = 5, SEG_MED_MAX = 18;
+        const int SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 64;
+        const double SPAWN_ON_ERASE = 0.15;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
         const int RESTART_GAP = 22;          // how far above the top a finished column restarts
         const int LEVELS = 48;               // brightness quantization for the glyph cache (smooth gradient)
 
@@ -225,6 +233,11 @@ namespace MatrixScreensaver
         readonly float[] head;
         readonly float[] speed;
         readonly int[] prevRow;
+        // Secondary "regrowth" heads, spawned where code was just erased: they fall and
+        // re-write the gap. A third way the rain is built, besides wrap-around restart
+        // (head past the bottom) and post-wipe restart (INTERRUPT_CHANCE).
+        readonly List<Sprout> sprouts = new List<Sprout>();
+        sealed class Sprout { public int Col; public float Pos; public float Speed; public int Prev; }
         readonly Random rnd = new Random();
         readonly Bitmap[,] cache;            // [glyph, level]; level LEVELS == bright head
         readonly Bitmap[,] cacheFlipped;     // same, mirrored horizontally
@@ -240,6 +253,15 @@ namespace MatrixScreensaver
 
         int GlyphIdx() { return rnd.Next(Glyphs.Length); }
         float RandSpeed() { return SPEED_MIN + (float)rnd.NextDouble() * (SPEED_MAX - SPEED_MIN); }
+
+        // Weighted erase length: usually a few characters, sometimes a segment, rarely a long chunk.
+        int SegLen()
+        {
+            double t = rnd.NextDouble();
+            if (t < SEG_SMALL_FRAC) return SEG_SMALL_MIN + rnd.Next(SEG_SMALL_MAX - SEG_SMALL_MIN + 1);
+            if (t < SEG_SMALL_FRAC + SEG_MED_FRAC) return SEG_MED_MIN + rnd.Next(SEG_MED_MAX - SEG_MED_MIN + 1);
+            return SEG_LARGE_MIN + rnd.Next(SEG_LARGE_MAX - SEG_LARGE_MIN + 1);
+        }
 
         public RainField(int widthPx, int heightPx, int fontPx)
         {
@@ -363,7 +385,8 @@ namespace MatrixScreensaver
                 if (Bright[idx] > 0.15f) { Flip[idx] = !Flip[idx]; Flash[idx] = FLASH_BOOST; }
             }
 
-            // ...and punch short gaps into random lit streams ("sections taken out").
+            // ...and punch random-scale gaps into random lit streams ("sections taken out"):
+            // a few stray characters, a mid-size segment, or a long chunk -- see SegLen().
             int segErases = Math.Max(1, (int)(Cols * SEG_ERASE_RATE));
             for (int k = 0; k < segErases; k++)
             {
@@ -372,9 +395,32 @@ namespace MatrixScreensaver
                 {
                     int baseIdx = (idx / Rows) * Rows;
                     int r0 = idx % Rows;
-                    int len = SEG_MIN + rnd.Next(SEG_MAX - SEG_MIN + 1);
+                    int len = SegLen();
                     for (int r = r0; r < r0 + len && r < Rows; r++) { Bright[baseIdx + r] = 0f; Flash[baseIdx + r] = 0f; }
+                    // ...and sometimes regrow: drop a fresh head in at the top of the gap so a
+                    // NEW stream re-writes where code was just removed (third build path).
+                    if (sprouts.Count < Cols && rnd.NextDouble() < SPAWN_ON_ERASE)
+                    {
+                        Chars[baseIdx + r0] = GlyphIdx(); Flip[baseIdx + r0] = rnd.NextDouble() < FLIP_CHANCE; Bright[baseIdx + r0] = 1f;
+                        sprouts.Add(new Sprout { Col = idx / Rows, Pos = r0, Speed = RandSpeed(), Prev = r0 });
+                    }
                 }
+            }
+
+            // Advance those regrowth heads like the main heads, dropping them off the bottom.
+            for (int s = sprouts.Count - 1; s >= 0; s--)
+            {
+                Sprout sp = sprouts[s];
+                sp.Pos += sp.Speed;
+                int nr = (int)Math.Floor(sp.Pos);
+                if (nr != sp.Prev)
+                {
+                    int b = sp.Col * Rows;
+                    for (int r = sp.Prev + 1; r <= nr; r++)
+                        if (r >= 0 && r < Rows) { Chars[b + r] = GlyphIdx(); Flip[b + r] = rnd.NextDouble() < FLIP_CHANCE; Bright[b + r] = 1f; }
+                    sp.Prev = nr;
+                }
+                if (sp.Pos > Rows + 6) sprouts.RemoveAt(s);
             }
         }
     }

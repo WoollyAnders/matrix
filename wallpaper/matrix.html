@@ -29,8 +29,16 @@
   const FLIP_RATE   = 0.0015; // fraction of cells mirrored horizontally per frame
   const FLIP_CHANCE = 0.28;   // chance a freshly-lit glyph spawns mirrored
   const INTERRUPT_CHANCE = 0.004; // per-frame chance a whole column is wiped & restarted ("being edited")
-  const SEG_ERASE_RATE = 0.06;  // segment-erase attempts per column per frame (punches gaps in streams)
-  const SEG_MIN = 5, SEG_MAX = 20; // erased segment length range (cells)
+  // "being edited": each erase punches a gap of a RANDOM scale into a lit stream --
+  // mostly a few stray characters, sometimes a segment, occasionally a long chunk
+  // (a whole-column wipe is the separate INTERRUPT_CHANCE above).
+  const SEG_ERASE_RATE = 0.12;  // erase attempts per column per frame
+  const SEG_SMALL_FRAC = 0.65;  // share of erases that nibble just a few chars
+  const SEG_MED_FRAC = 0.27;    // share that take out a mid-size segment (rest = long chunk)
+  const SEG_SMALL_MIN = 1, SEG_SMALL_MAX = 3;
+  const SEG_MED_MIN = 5, SEG_MED_MAX = 18;
+  const SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 64;
+  const SPAWN_ON_ERASE = 0.15;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
   const RESTART_GAP = 22;     // how far above the top a finished column restarts
   // -----------------------------------------------------------------------
 
@@ -42,8 +50,16 @@
   for (const ch of "0123456789*+-/<>=:;.?!^|()[]{}~") codes.push(ch.charCodeAt(0));
   const code = () => codes[(Math.random() * codes.length) | 0];
 
+  // Weighted erase length: usually a few characters, sometimes a segment, rarely a long chunk.
+  function segLen() {
+    const t = Math.random();
+    if (t < SEG_SMALL_FRAC) return SEG_SMALL_MIN + ((Math.random() * (SEG_SMALL_MAX - SEG_SMALL_MIN + 1)) | 0);
+    if (t < SEG_SMALL_FRAC + SEG_MED_FRAC) return SEG_MED_MIN + ((Math.random() * (SEG_MED_MAX - SEG_MED_MIN + 1)) | 0);
+    return SEG_LARGE_MIN + ((Math.random() * (SEG_LARGE_MAX - SEG_LARGE_MIN + 1)) | 0);
+  }
+
   let W, H, fontSize, cellW, cellH, cols, rows;
-  let bright, chars, flip, flash, head, speed, prevRow;
+  let bright, chars, flip, flash, head, speed, prevRow, sprouts;
 
   function resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -71,6 +87,7 @@
     head    = new Float32Array(cols);
     speed   = new Float32Array(cols);
     prevRow = new Int32Array(cols);
+    sprouts = [];   // secondary heads spawned where code was erased (reset on resize)
     for (let c = 0; c < cols; c++) {
       head[c] = -Math.random() * rows;
       speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
@@ -135,16 +152,42 @@
       if (bright[idx] > 0.15) { flip[idx] ^= 1; flash[idx] = FLASH_BOOST; }
     }
 
-    // 6) ...and punch short gaps into random lit streams ("sections taken out")
+    // 6) ...and punch random-scale gaps into random lit streams ("sections taken out"):
+    //    a few stray characters, a mid-size segment, or a long chunk -- see segLen()
     const segErases = Math.max(1, (cols * SEG_ERASE_RATE) | 0);
     for (let k = 0; k < segErases; k++) {
       const idx = (Math.random() * bright.length) | 0;
       if (bright[idx] > 0.2) {
         const base = ((idx / rows) | 0) * rows;
         const r0 = idx % rows;
-        const len = SEG_MIN + ((Math.random() * (SEG_MAX - SEG_MIN + 1)) | 0);
+        const len = segLen();
         for (let r = r0; r < r0 + len && r < rows; r++) { bright[base + r] = 0; flash[base + r] = 0; }
+        // ...and sometimes regrow: drop a fresh head in at the top of the gap so a NEW
+        // stream re-writes where code was just removed (third build path).
+        if (sprouts.length < cols && Math.random() < SPAWN_ON_ERASE) {
+          chars[base + r0] = code(); flip[base + r0] = (Math.random() < FLIP_CHANCE) ? 1 : 0; bright[base + r0] = 1.0;
+          sprouts.push({ col: (idx / rows) | 0, pos: r0, speed: SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN), prev: r0 });
+        }
       }
+    }
+
+    // 7) advance those regrowth heads like the main heads, dropping them off the bottom
+    for (let s = sprouts.length - 1; s >= 0; s--) {
+      const sp = sprouts[s];
+      sp.pos += sp.speed;
+      const nr = Math.floor(sp.pos);
+      if (nr !== sp.prev) {
+        const b = sp.col * rows;
+        for (let r = sp.prev + 1; r <= nr; r++) {
+          if (r >= 0 && r < rows) {
+            chars[b + r] = code();
+            flip[b + r] = (Math.random() < FLIP_CHANCE) ? 1 : 0;
+            bright[b + r] = 1.0;
+          }
+        }
+        sp.prev = nr;
+      }
+      if (sp.pos > rows + 6) sprouts.splice(s, 1);
     }
   }
 
