@@ -2,20 +2,38 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<!-- Lock the viewport: real fullscreen, no pinch-zoom, cover notches/cutouts. -->
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, minimum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
 <title>Matrix</title>
 <style>
-  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
-  #c { display: block; }
+  html, body {
+    margin: 0; padding: 0; height: 100%; width: 100%;
+    background: #000; overflow: hidden;
+    overscroll-behavior: none;            /* no rubber-banding */
+    touch-action: none;                   /* no scroll/zoom gestures */
+    -webkit-user-select: none; user-select: none;
+    -webkit-touch-callout: none;          /* no long-press menu */
+    -webkit-tap-highlight-color: transparent;
+  }
+  /* Fixed, full-screen canvas anchored to the true top-left (under any cutout). */
+  #c { display: block; position: fixed; top: 0; left: 0; }
 </style>
 </head>
 <body>
 <canvas id="c"></canvas>
 <script>
-// Matrix "digital rain". Each grid cell keeps its OWN character and brightness:
-// the leading head is near-white, the trail behind it is the SAME characters
-// fading to green, and occasionally a random cell flips to a new glyph (the
-// authentic flicker). Works as a Lively HTML wallpaper, incl. spanned displays.
+// Matrix "digital rain" -- ANDROID KIOSK / WEBVIEW build.
+// Same rain engine and tunables as wallpaper/matrix.html (keep them identical);
+// only the PLATFORM layer differs: orientation-aware glyph sizing instead of the
+// desktop window.screen.height assumption, an Android-safe font stack, a
+// devicePixelRatio cap for weaker tablet GPUs, screen wake-lock, and tap-to-exit.
+// Each grid cell keeps its OWN character and brightness: the leading head is
+// near-white, the trail behind it is the SAME characters fading to green, and
+// occasionally a random cell flips to a new glyph (the authentic flicker).
 (function () {
   // ---- tunables ---------------------------------------------------------
   const FRAME_MS   = 50;     // higher = slower animation (~20 fps)
@@ -48,6 +66,10 @@
   const MID_FREEZE_CHANCE = 0.002; // per-frame chance a still-FALLING line stops mid-screen and freezes in place
   const MIN_FREEZE_LEN = 10;  // a line must have drawn at least this many chars before it may freeze (no 1-char freezes)
   const STAY_BRIGHT = 0.78;   // brightness ceiling for a frozen line: it holds the glow it had, capped here (steady green, never a white head)
+  // ---- kiosk/platform tunables -----------------------------------------
+  const GRID_DIV   = 48;     // glyph rows across the SHORT screen edge (higher = smaller, denser rain)
+  const DPR_CAP    = 2;      // cap devicePixelRatio -- keeps a 3x tablet panel from over-rendering
+  const FONT_STACK = "'Noto Sans Mono CJK JP','Noto Sans CJK JP','Droid Sans Mono',monospace";
   const LEVELS     = 48;     // brightness quantization for the glyph atlas (49 tiles/glyph; matches src/Matrix.cs)
   // -----------------------------------------------------------------------
 
@@ -112,10 +134,10 @@
   // Pre-render every glyph at every brightness level into two offscreen sprite-sheets
   // (normal + mirrored), so each frame is a fast drawImage blit instead of a per-cell
   // fillText. This is the canvas analogue of the glyph bitmap cache in src/Matrix.cs.
-  // If the device can't allocate a full-size atlas, halve the level count and retry -- the
-  // fast path survives, only the gradient gets coarser. atlasLevels === 0 means even the
-  // smallest atlas failed and render() falls back to direct fillText. Rebuilt from resize()
-  // when the cell size / font changes -- never in the frame loop.
+  // If the device can't allocate a full-size atlas (weak/old kiosk WebView), halve the
+  // level count and retry -- the fast path survives, only the gradient gets coarser.
+  // atlasLevels === 0 means even the smallest atlas failed and render() falls back to
+  // direct fillText. Rebuilt from resize() when cell size / font changes -- never per frame.
   function buildAtlas() {
     atlas = atlasFlip = null; atlasLevels = 0;
     for (let lv = LEVELS; lv >= 6; lv = lv >> 1) {
@@ -126,17 +148,19 @@
   }
 
   function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    W = canvas.width = Math.floor(window.innerWidth * dpr);
-    H = canvas.height = Math.floor(window.innerHeight * dpr);
-    canvas.style.width = window.innerWidth + 'px';
-    canvas.style.height = window.innerHeight + 'px';
+    // Cap the pixel ratio so a 2x/3x tablet panel doesn't render millions of extra
+    // cells per frame -- the rain looks the same and stays smooth on weak GPUs.
+    const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+    const cssW = window.innerWidth, cssH = window.innerHeight;
+    W = canvas.width = Math.floor(cssW * dpr);
+    H = canvas.height = Math.floor(cssH * dpr);
+    canvas.style.width = cssW + 'px';
+    canvas.style.height = cssH + 'px';
 
-    // Glyph size keyed to a single monitor's height, so it looks the same
-    // whether Lively runs us per-monitor or spanned across all displays.
-    const refH = ((window.screen && window.screen.height) ? window.screen.height : 1080) * dpr;
-    fontSize = Math.max(14, Math.floor(refH / 55));
-    fontStr = "bold " + fontSize + "px 'MS Gothic','Yu Gothic',monospace";
+    // Glyph size keyed to the SHORT edge of THIS screen, so the rain has the same
+    // density in portrait or landscape and on any tablet -- no desktop-monitor guess.
+    fontSize = Math.max(12, Math.floor(Math.min(W, H) / GRID_DIV));
+    fontStr = "bold " + fontSize + "px " + FONT_STACK;
     ctx.font = fontStr;
     ctx.textBaseline = 'top';
     cellW = Math.max(6, Math.ceil(ctx.measureText('ｴ').width));
@@ -170,6 +194,8 @@
   }
 
   window.addEventListener('resize', resize);
+  // Tablets fire orientationchange slightly before the new size is final; settle, then resize.
+  window.addEventListener('orientationchange', function () { setTimeout(resize, 200); });
   resize();
 
   function step() {
@@ -341,7 +367,8 @@
       }
       return;
     }
-    // fallback: the atlas couldn't be allocated on this device -- draw glyphs directly.
+    // fallback: the atlas couldn't be allocated on this device -- draw glyphs directly
+    // (slower, but guarantees the rain still renders rather than failing to load).
     ctx.font = fontStr;
     for (let c = 0; c < cols; c++) {
       const x = c * cellW;
@@ -372,6 +399,21 @@
     render();
   }
   requestAnimationFrame(loop);
+
+  // Keep the panel awake while the rain shows (kiosk apps usually do this too, but
+  // this re-asserts it). Re-acquire after the tab is backgrounded and returns.
+  let wakeLock = null;
+  async function keepAwake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', function () {
+    if (document.visibilityState === 'visible') keepAwake();
+  });
+  keepAwake();
+
+  // Tap-to-exit: most kiosk browsers dismiss their own screensaver on touch, so this
+  // is a harmless extra -- window.close() simply no-ops where the browser disallows it.
+  window.addEventListener('pointerdown', function () { try { window.close(); } catch (e) {} }, { passive: true });
 })();
 </script>
 </body>

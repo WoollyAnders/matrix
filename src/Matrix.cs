@@ -98,7 +98,7 @@ namespace MatrixScreensaver
             List<MatrixForm> windows = new List<MatrixForm>();
             foreach (Screen s in Screen.AllScreens)
                 windows.Add(MatrixForm.Screensaver(field, s.Bounds, vs.Location, lockOnExit));
-            Application.Run(new RainController(field, windows, 50));
+            Application.Run(new RainController(field, windows, 50, lockOnExit));
         }
 
         static void RunWallpaper()
@@ -201,26 +201,33 @@ namespace MatrixScreensaver
     // Mirrors wallpaper/matrix.html.
     class RainField
     {
-        const float DECAY = 0.96f;           // trail fade per step (higher = longer tails)
-        const float SPEED_MIN = 0.45f, SPEED_MAX = 1.0f; // rows per step
+        const float DECAY = 0.97f;           // trail fade per step (higher = longer tails)
+        const float SPEED_MIN = 0.30f, SPEED_MAX = 0.70f; // rows per step
         const double CHANGE_CHANCE = 0.10;   // per-step chance a lit trailing glyph silently morphs (constant churn)
+        const float MORPH_STEP = 0.25f;      // glyph-switch fade speed (1/frames) -- higher = quicker switch
+        const float MORPH_DIP = 0.65f;       // how far a glyph dims at the switch midpoint (fade old out -> swap -> fade new in)
         const double GLITCH_RATE = 0.0020;   // fraction of cells that change glyph WITH a flash (emphasis pops)
         const float FLASH_BOOST = 0.5f;      // momentary extra glow when a glyph changes/flips
         const float FLASH_DECAY = 0.45f;     // how fast that flash fades (low = brief); base tail fade is unchanged
         const double FLIP_RATE = 0.0015;     // fraction of cells mirrored horizontally per step
         const float FLIP_CHANCE = 0.28f;     // chance a freshly-lit glyph spawns mirrored
-        const double INTERRUPT_CHANCE = 0.004; // per-step chance a whole column is wiped & restarted ("being edited")
+        const double INTERRUPT_CHANCE = 0.0005; // per-step chance a whole column is wiped & restarted -- RARE (full-line removal)
         // "being edited": each erase punches a gap of a RANDOM scale into a lit stream --
         // mostly a few stray characters, sometimes a segment, occasionally a long chunk
         // (a whole-column wipe is the separate INTERRUPT_CHANCE above).
-        const double SEG_ERASE_RATE = 0.12;  // erase attempts per column per step
-        const double SEG_SMALL_FRAC = 0.65;  // share of erases that nibble just a few chars
-        const double SEG_MED_FRAC = 0.27;    // share that take out a mid-size segment (rest = long chunk)
+        const double SEG_ERASE_RATE = 0.12;  // erase attempts per step -- small-portion edits (kept modest so they don't strip standing lines)
+        const double SEG_SMALL_FRAC = 0.72;  // share of erases that nibble just a few chars
+        const double SEG_MED_FRAC = 0.24;    // share that take out a mid-size segment (rest = long chunk)
         const int SEG_SMALL_MIN = 1, SEG_SMALL_MAX = 3;
         const int SEG_MED_MIN = 5, SEG_MED_MAX = 18;
-        const int SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 64;
+        const int SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 44;
         const double SPAWN_ON_ERASE = 0.15;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
+        const double TOP_SPROUT_CHANCE = 0.30; // per-step chance to drop a fresh white head at the top of a bare-topped frozen column (refills the top; self-limits as the screen fills)
         const int RESTART_GAP = 22;          // how far above the top a finished column restarts
+        const double FREEZE_CHANCE = 0.20;   // when a head reaches the bottom: chance the fallen line STAYS in place (frozen, still churning) instead of restarting -- raise for more, lower for fewer
+        const double MID_FREEZE_CHANCE = 0.002; // per-step chance a still-FALLING line stops mid-screen and freezes in place
+        const int MIN_FREEZE_LEN = 10;       // a line must have drawn at least this many chars before it may freeze (no 1-char freezes)
+        const float STAY_BRIGHT = 0.78f;     // brightness ceiling for a frozen line: it holds the glow it had, capped here (steady green, never a white head)
         const int LEVELS = 48;               // brightness quantization for the glyph cache (smooth gradient)
 
         public readonly Font Font;
@@ -229,10 +236,14 @@ namespace MatrixScreensaver
         public readonly int[] Chars;         // glyph index per cell
         public readonly bool[] Flip;         // drawn horizontally mirrored?
         public readonly float[] Flash;       // momentary glow on change/flip; fades fast, separate from the tail
+        readonly float[] morph;              // per-cell glyph-switch fade phase (1 -> 0; 0 = none)
+        readonly int[] morphTo;              // pending glyph index to swap to at the fade midpoint
 
         readonly float[] head;
         readonly float[] speed;
         readonly int[] prevRow;
+        readonly bool[] frozen;              // true = column has frozen into static code (set on reaching bottom)
+        readonly int[] lit;                  // length of each column's current falling line (gates freezing)
         // Secondary "regrowth" heads, spawned where code was just erased: they fall and
         // re-write the gap. A third way the rain is built, besides wrap-around restart
         // (head past the bottom) and post-wipe restart (INTERRUPT_CHANCE).
@@ -280,9 +291,13 @@ namespace MatrixScreensaver
             Chars = new int[Cols * Rows];
             Flip = new bool[Cols * Rows];
             Flash = new float[Cols * Rows];
+            morph = new float[Cols * Rows];
+            morphTo = new int[Cols * Rows];
             head = new float[Cols];
             speed = new float[Cols];
             prevRow = new int[Cols];
+            frozen = new bool[Cols];
+            lit = new int[Cols];
             for (int c = 0; c < Cols; c++)
             {
                 // Start every column above the top (staggered) so the rain cascades
@@ -333,40 +348,96 @@ namespace MatrixScreensaver
             return flipped ? cacheFlipped[glyphIdx, l] : cache[glyphIdx, l];
         }
 
+        // Glyph-switch fade: a transitioning cell dims toward MORPH_DIP at the swap midpoint, full at the ends.
+        public float MorphDip(int idx)
+        {
+            float m = morph[idx];
+            if (m <= 0f) return 1f;
+            return 1f - MORPH_DIP * (1f - Math.Abs(m * 2f - 1f));
+        }
+
         public void Step()
         {
-            for (int i = 0; i < Bright.Length; i++)
+            // Fade every cell a little. Frozen columns DON'T fade to black: a bright head
+            // settles down to STAY_BRIGHT and then holds, so the column stays as steady,
+            // still-churning code until it is edited away.
+            for (int c = 0; c < Cols; c++)
             {
-                if (Bright[i] > 0.001f) Bright[i] *= DECAY;
-                if (Flash[i] > 0.001f) Flash[i] *= FLASH_DECAY; else Flash[i] = 0f;
-                // constantly cycle visible trailing glyphs (no flash) -- the "always changing" look
-                if (Bright[i] > 0.12f && rnd.NextDouble() < CHANGE_CHANCE) Chars[i] = GlyphIdx();
+                bool fr = frozen[c];
+                int baseIdx = c * Rows;
+                for (int r = 0; r < Rows; r++)
+                {
+                    int i = baseIdx + r;
+                    if (fr)
+                    {
+                        if (Bright[i] > STAY_BRIGHT) { Bright[i] *= DECAY; if (Bright[i] < STAY_BRIGHT) Bright[i] = STAY_BRIGHT; }
+                    }
+                    else if (Bright[i] > 0.001f) Bright[i] *= DECAY;
+                    if (Flash[i] > 0.001f) Flash[i] *= FLASH_DECAY; else Flash[i] = 0f;
+                    // glyph churn with a soft fade: dim the old char out, swap at the dim point, fade the new in
+                    if (morph[i] > 0f) { morph[i] -= MORPH_STEP; if (morph[i] <= 0.5f) Chars[i] = morphTo[i]; if (morph[i] < 0f) morph[i] = 0f; }
+                    else if (Bright[i] > 0.12f && rnd.NextDouble() < CHANGE_CHANCE) { morphTo[i] = GlyphIdx(); morph[i] = 1f; }
+                }
             }
 
             for (int c = 0; c < Cols; c++)
             {
+                int baseIdx = c * Rows;
+                if (frozen[c])
+                {
+                    // Frozen column: stays as static churning code until an interrupt edits it away
+                    // (now rare), then a fresh head falls from the top to re-write the lost line of code.
+                    if (rnd.NextDouble() < INTERRUPT_CHANCE)
+                    {
+                        for (int r = 0; r < Rows; r++) { Bright[baseIdx + r] = 0f; Flash[baseIdx + r] = 0f; }
+                        frozen[c] = false;
+                        head[c] = -rnd.Next(RESTART_GAP);
+                        prevRow[c] = (int)Math.Floor(head[c]);
+                        speed[c] = RandSpeed();
+                        lit[c] = 0;
+                    }
+                    continue;
+                }
                 head[c] += speed[c];
                 int nr = (int)Math.Floor(head[c]);
                 if (nr != prevRow[c])
                 {
                     for (int r = prevRow[c] + 1; r <= nr; r++)
-                        if (r >= 0 && r < Rows) { int idx = c * Rows + r; Chars[idx] = GlyphIdx(); Flip[idx] = rnd.NextDouble() < FLIP_CHANCE; Bright[idx] = 1f; }
+                        if (r >= 0 && r < Rows) { int idx = baseIdx + r; Chars[idx] = GlyphIdx(); Flip[idx] = rnd.NextDouble() < FLIP_CHANCE; Bright[idx] = 1f; lit[c]++; }
                     prevRow[c] = nr;
                 }
                 if (head[c] > Rows + 6)
                 {
-                    head[c] = -rnd.Next(RESTART_GAP);
-                    prevRow[c] = (int)Math.Floor(head[c]);
-                    speed[c] = RandSpeed();
+                    // only a long-enough line may stay; short ones just restart from the top
+                    if (lit[c] >= MIN_FREEZE_LEN && rnd.NextDouble() < FREEZE_CHANCE)
+                    {
+                        // reached the bottom -> the fallen line STAYS as-is: no relight, no new head.
+                        // It holds the code it already drew and keeps churning until an interrupt edits it away.
+                        frozen[c] = true;
+                    }
+                    else
+                    {
+                        head[c] = -rnd.Next(RESTART_GAP);
+                        prevRow[c] = (int)Math.Floor(head[c]);
+                        speed[c] = RandSpeed();
+                        lit[c] = 0;
+                    }
+                }
+                else if (lit[c] >= MIN_FREEZE_LEN && rnd.NextDouble() < MID_FREEZE_CHANCE)
+                {
+                    // a long-enough still-falling line can stop mid-screen and freeze in place, holding
+                    // the code it has drawn so far and churning -- just like a line that reached the bottom.
+                    frozen[c] = true;
                 }
                 else if (rnd.NextDouble() < INTERRUPT_CHANCE)
                 {
-                    // "being edited": wipe this stream, then replace it -- half the time a
+                    // "being edited" (rare): wipe this whole stream, then replace it -- half the time a
                     // fresh stream from the top (renewal), half a mid-screen reappearance (edit).
-                    for (int r = 0; r < Rows; r++) { int idx = c * Rows + r; Bright[idx] = 0f; Flash[idx] = 0f; }
+                    for (int r = 0; r < Rows; r++) { int idx = baseIdx + r; Bright[idx] = 0f; Flash[idx] = 0f; }
                     head[c] = (rnd.NextDouble() < 0.5) ? -(float)(rnd.NextDouble() * RESTART_GAP) : (float)(rnd.NextDouble() * Rows);
                     prevRow[c] = (int)Math.Floor(head[c]);
                     speed[c] = RandSpeed();
+                    lit[c] = 0;
                 }
             }
 
@@ -407,6 +478,20 @@ namespace MatrixScreensaver
                 }
             }
 
+            // Keep the TOP from going bare: occasionally drop a fresh white head at the top of a
+            // frozen column whose top has faded out. It falls and re-lights the column, meeting /
+            // overwriting the standing line below (which holds at STAY_BRIGHT as the head passes).
+            if (sprouts.Count < Cols && rnd.NextDouble() < TOP_SPROUT_CHANCE)
+            {
+                int col = rnd.Next(Cols);
+                if (frozen[col] && Bright[col * Rows] < 0.3f)
+                {
+                    int b = col * Rows;
+                    Chars[b] = GlyphIdx(); Flip[b] = rnd.NextDouble() < FLIP_CHANCE; Bright[b] = 1f;
+                    sprouts.Add(new Sprout { Col = col, Pos = 0, Speed = RandSpeed(), Prev = 0 });
+                }
+            }
+
             // Advance those regrowth heads like the main heads, dropping them off the bottom.
             for (int s = sprouts.Count - 1; s >= 0; s--)
             {
@@ -428,9 +513,13 @@ namespace MatrixScreensaver
     // One timer drives the shared field and repaints every window.
     class RainController : ApplicationContext
     {
-        readonly Timer timer;
+        [DllImport("user32.dll")] static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
+        const uint MOUSEEVENTF_MOVE = 0x0001;
 
-        public RainController(RainField field, List<MatrixForm> windows, int interval)
+        readonly Timer timer;
+        readonly Timer jiggle;
+
+        public RainController(RainField field, List<MatrixForm> windows, int interval, bool keepAwake = false)
         {
             foreach (MatrixForm w in windows)
             {
@@ -445,6 +534,21 @@ namespace MatrixScreensaver
                 for (int i = 0; i < windows.Count; i++) windows[i].RenderStep();
             };
             timer.Start();
+
+            if (keepAwake)
+            {
+                // Keep the machine awake while the lock curtain is up: a net-zero mouse "jiggle"
+                // every 60s resets the input-idle timer so the inactivity auto-lock can't fire and
+                // cut off the rain. Authorized keep-awake; stops automatically when the curtain exits
+                // (Esc -> LockWorkStation). The curtain ignores this injected move -- only Esc dismisses it.
+                jiggle = new Timer();
+                jiggle.Interval = 60000;
+                jiggle.Tick += delegate
+                {
+                    try { mouse_event(MOUSEEVENTF_MOVE, 1, 0, 0, IntPtr.Zero); mouse_event(MOUSEEVENTF_MOVE, -1, 0, 0, IntPtr.Zero); } catch { }
+                };
+                jiggle.Start();
+            }
         }
     }
 
@@ -579,10 +683,12 @@ namespace MatrixScreensaver
                 int baseIdx = c * field.Rows;
                 for (int r = rStart; r <= rEnd; r++)
                 {
-                    float b = field.Bright[baseIdx + r] + field.Flash[baseIdx + r];
+                    int idx = baseIdx + r;
+                    float b = field.Bright[idx] + field.Flash[idx];
                     if (b <= 0.04f) continue;
+                    b *= field.MorphDip(idx);
                     if (b > 1f) b = 1f;
-                    gBuf.DrawImageUnscaled(field.Tile(field.Chars[baseIdx + r], b, field.Flip[baseIdx + r]), lx, r * field.CellH - offsetY);
+                    gBuf.DrawImageUnscaled(field.Tile(field.Chars[idx], b, field.Flip[idx]), lx, r * field.CellH - offsetY);
                 }
             }
 
@@ -596,13 +702,36 @@ namespace MatrixScreensaver
 
         protected override void OnPaintBackground(PaintEventArgs e) { /* buffer covers it */ }
 
-        protected override void OnKeyDown(KeyEventArgs e) { if (mode == RunMode.Screensaver && armed) Dismiss(); }
-        protected override void OnMouseDown(MouseEventArgs e) { if (mode == RunMode.Screensaver && armed) Dismiss(); }
-        protected override void OnMouseMove(MouseEventArgs e)
+        // The /lock "keep-awake curtain" stays up through the mouse jiggle and any other input --
+        // ONLY Esc dismisses it (which then locks the workstation). The plain idle screensaver
+        // keeps the classic behavior: any key or mouse movement dismisses it.
+        protected override void OnKeyDown(KeyEventArgs e)
         {
             if (mode != RunMode.Screensaver || !armed) return;
+            if (lockOnExit) { if (e.KeyCode == Keys.Escape) Dismiss(); }
+            else Dismiss();
+        }
+        protected override void OnMouseDown(MouseEventArgs e) { if (mode == RunMode.Screensaver && armed && !lockOnExit) Dismiss(); }
+        protected override void OnMouseMove(MouseEventArgs e)
+        {
+            if (mode != RunMode.Screensaver || !armed || lockOnExit) return;
             Point p = Cursor.Position;
             if (Math.Abs(p.X - armCursor.X) > 8 || Math.Abs(p.Y - armCursor.Y) > 8) Dismiss();
+        }
+
+        // The keep-awake lock curtain has exactly one user-facing way out: lock. Route any
+        // user-initiated close (Alt+F4, etc.) through Dismiss() so it locks the workstation
+        // instead of dropping to the unlocked desktop. (The Application.Exit during lock
+        // teardown reports ApplicationExitCall, not UserClosing, so it isn't re-routed.)
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (mode == RunMode.Screensaver && lockOnExit && !dismissing && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Dismiss();
+                return;
+            }
+            base.OnFormClosing(e);
         }
 
         static bool dismissing;
