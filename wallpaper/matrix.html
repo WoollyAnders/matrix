@@ -71,7 +71,7 @@
 
   let W, H, fontSize, cellW, cellH, cols, rows, fontStr;
   let bright, chars, flip, flash, head, speed, prevRow, sprouts, frozen, lit, morph, morphTo;
-  let atlas, atlasFlip, atlasLevels = 0;   // sprite-sheets + the level count actually baked (0 = atlas unavailable)
+  let atlas, atlasFlip, atlasLevels = 0, atlasPerRow = 0;   // sprite-sheets + baked level count + glyph-tiles per atlas row (0 levels = atlas unavailable)
 
   // Same gradient as the live render path (and src/Matrix.cs): pure-white head ->
   // matrix green -> black tail, keyed by quantized level. maxLevel = top index in use.
@@ -83,11 +83,15 @@
     return 'rgb(' + cr + ',' + cg + ',' + cb + ')';
   }
 
-  // Paint one sprite-sheet (normal or mirrored) with `nLevels` brightness tiles per glyph.
-  // Returns the canvas, or null if this device can't allocate it (weak/old WebView canvas
-  // limits -> getContext null or the dimensions get clamped). Layout: glyph -> column, level -> row.
-  function paintSheet(nLevels, mirror) {
-    const sheetW = codes.length * cellW, sheetH = nLevels * cellH;
+  // Paint one sprite-sheet (normal or mirrored). Tiles are packed in 2D -- `perRow`
+  // tiles per row, wrapping to as many rows as needed -- so NEITHER dimension exceeds
+  // the texture cap (a single long row did, and blitted black). Tile index
+  // ti = glyph*nLevels + level sits at (ti % perRow, ti / perRow). Returns the canvas,
+  // or null if the device clamps the size or can't allocate it.
+  function paintSheet(nLevels, perRow, mirror) {
+    const tilesT = codes.length * nLevels;
+    const rowsT = Math.ceil(tilesT / perRow);
+    const sheetW = perRow * cellW, sheetH = rowsT * cellH;
     try {
       const cv = document.createElement('canvas');
       cv.width = sheetW; cv.height = sheetH;
@@ -98,30 +102,65 @@
       g.font = fontStr; g.textBaseline = 'top';
       for (let gi = 0; gi < codes.length; gi++) {
         const ch = String.fromCharCode(codes[gi]);   // build-time only, never per frame
-        const dx = gi * cellW;
         for (let l = 0; l < nLevels; l++) {
+          const ti = gi * nLevels + l;
+          const dx = (ti % perRow) * cellW, dy = ((ti / perRow) | 0) * cellH;
           g.fillStyle = levelColor(l, nLevels - 1);
-          if (mirror) { g.save(); g.translate(dx + cellW, l * cellH); g.scale(-1, 1); g.fillText(ch, 0, 0); g.restore(); }
-          else g.fillText(ch, dx, l * cellH);
+          if (mirror) { g.save(); g.translate(dx + cellW, dy); g.scale(-1, 1); g.fillText(ch, 0, 0); g.restore(); }
+          else g.fillText(ch, dx, dy);
         }
       }
       return cv;
     } catch (e) { return null; }
   }
 
-  // Pre-render every glyph at every brightness level into two offscreen sprite-sheets
+  // Confirm a freshly painted sheet actually BLITS (not just allocates): some WebViews
+  // accept an oversized canvas yet draw nothing from it. Copy the brightest tile of
+  // glyph 0 onto a scratch canvas and check it isn't all black. Cheap insurance against
+  // a silent black screen -- on failure, render() drops to the direct-draw fallback.
+  function atlasBlits(sheet, lv, perRow) {
+    try {
+      const ti = lv;                              // glyph 0, brightest level (= lv): near-white ink
+      const sx = (ti % perRow) * cellW, sy = ((ti / perRow) | 0) * cellH;
+      const t = document.createElement('canvas');
+      t.width = cellW; t.height = cellH;
+      const tg = t.getContext('2d');
+      tg.fillStyle = '#000'; tg.fillRect(0, 0, cellW, cellH);
+      tg.drawImage(sheet, sx, sy, cellW, cellH, 0, 0, cellW, cellH);
+      const d = tg.getImageData(0, 0, cellW, cellH).data;
+      for (let i = 0; i < d.length; i += 4) if (d[i] || d[i + 1] || d[i + 2]) return true;
+      return false;
+    } catch (e) { return false; }
+  }
+
+  // Pre-render every glyph at every brightness level into two 2D-packed sprite-sheets
   // (normal + mirrored), so each frame is a fast drawImage blit instead of a per-cell
   // fillText. This is the canvas analogue of the glyph bitmap cache in src/Matrix.cs.
-  // If the device can't allocate a full-size atlas, halve the level count and retry -- the
+  // The atlas is packed under the GPU's texture cap; if the full-resolution sheet won't
+  // fit (too tall) or won't blit on this device, halve the level count and retry -- the
   // fast path survives, only the gradient gets coarser. atlasLevels === 0 means even the
-  // smallest atlas failed and render() falls back to direct fillText. Rebuilt from resize()
-  // when the cell size / font changes -- never in the frame loop.
+  // smallest atlas failed and render() falls back to direct fillText. Rebuilt from
+  // resize() when the cell size / font changes -- never in the frame loop.
   function buildAtlas() {
-    atlas = atlasFlip = null; atlasLevels = 0;
+    atlas = atlasFlip = null; atlasLevels = 0; atlasPerRow = 0;
+    // Pack under a CONSERVATIVE FIXED cap -- NOT the device's real MAX_TEXTURE_SIZE.
+    // 2048 is the GLES2-guaranteed minimum, so it is safe in BOTH dimensions on every
+    // GPU. We deliberately do NOT probe the cap with a throwaway WebGL context: on weak
+    // tablet WebViews, creating one alongside the large 2D atlas canvases can crash the
+    // GPU process, and a probe only ever let us build a BIGGER atlas -- the wrong
+    // direction. A smaller-than-needed atlas is free: it is built once per resize and
+    // every tile blit costs the same regardless of sheet size.
+    const cap = 2048;
+    const perRow = Math.max(1, (cap / cellW) | 0);   // glyph-tiles per row that fit under the width cap
     for (let lv = LEVELS; lv >= 6; lv = lv >> 1) {
-      const a = paintSheet(lv + 1, false);
-      const f = a && paintSheet(lv + 1, true);
-      if (a && f) { atlas = a; atlasFlip = f; atlasLevels = lv; return; }
+      const nLevels = lv + 1;
+      const rowsT = Math.ceil(codes.length * nLevels / perRow);
+      if (rowsT * cellH > cap) continue;             // too tall at this level count -- coarsen and retry
+      const a = paintSheet(nLevels, perRow, false);
+      const f = a && paintSheet(nLevels, perRow, true);
+      if (a && f && atlasBlits(a, lv, perRow) && atlasBlits(f, lv, perRow)) {
+        atlas = a; atlasFlip = f; atlasLevels = lv; atlasPerRow = perRow; return;
+      }
     }
   }
 
@@ -324,7 +363,9 @@
     ctx.fillStyle = '#000';
     ctx.fillRect(0, 0, W, H);
     if (atlasLevels > 0) {
-      // fast path: each lit cell is one pre-rendered glyph blit
+      // fast path: each lit cell is one pre-rendered glyph blit (tiles are 2D-packed:
+      // tile ti = glyph*nLevels + level lives at (ti % atlasPerRow, ti / atlasPerRow))
+      const nLevels = atlasLevels + 1, perRow = atlasPerRow;
       for (let c = 0; c < cols; c++) {
         const x = c * cellW;
         const base = c * rows;
@@ -336,7 +377,9 @@
           if (b > 1) b = 1;                            // clamp BEFORE quantizing (flash can push b > 1)
           let lvl = (b * atlasLevels + 0.5) | 0;       // round to nearest baked level
           if (lvl > atlasLevels) lvl = atlasLevels;
-          ctx.drawImage(flip[i] ? atlasFlip : atlas, chars[i] * cellW, lvl * cellH, cellW, cellH, x, r * cellH, cellW, cellH);
+          const ti = chars[i] * nLevels + lvl;
+          const sx = (ti % perRow) * cellW, sy = ((ti / perRow) | 0) * cellH;
+          ctx.drawImage(flip[i] ? atlasFlip : atlas, sx, sy, cellW, cellH, x, r * cellH, cellW, cellH);
         }
       }
       return;
