@@ -18,6 +18,7 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Drawing.Text;
 using System.IO;
@@ -201,21 +202,44 @@ namespace MatrixScreensaver
     // Mirrors wallpaper/matrix.html.
     class RainField
     {
-        const float DECAY = 0.97f;           // trail fade per step (higher = longer tails)
+        // NO FADE: a lit cell is NOT a comet-tail that decays to black. A fresh head is
+        // full-bright and quickly SETTLES to the steady body brightness, then HOLDS there
+        // forever -- columns are cleared only by erases / collapses / interrupts, never by
+        // fading. (Matches the film: a bright head over solid, non-fading green code.)
+        const float BODY_BRIGHT = 0.62f;     // steady green a lit cell holds at (== the color-ramp split)
+        const float HEAD_SETTLE = 0.80f;     // per-step multiplier above BODY_BRIGHT -> taller (~3-cell) bright head, easier to pick out
+        // Green-blue (teal-leaning) ramp with a near-white -- not pure white -- head.
+        static readonly int[] COL_TAIL = { 0, 25, 18 };    // deep teal, only seen briefly as a cell clears
+        static readonly int[] COL_BODY = { 0, 235, 140 };  // the steady Matrix green (blue-leaning vs the old 0,255,70)
+        static readonly int[] COL_HEAD = { 235, 255, 250 };// near-white mint head (bright, but not pure RGB 255,255,255)
+        public static readonly int[] COL_HEAD_GLOW = { 160, 250, 240 }; // head-GLOW color -- near-white TEAL (not pure white); used by MatrixForm's head halo
         const float SPEED_MIN = 0.30f, SPEED_MAX = 0.70f; // rows per step
-        const double CHANGE_CHANCE = 0.10;   // per-step chance a lit trailing glyph silently morphs (constant churn)
-        const float MORPH_STEP = 0.25f;      // glyph-switch fade speed (1/frames) -- higher = quicker switch
+        const double CHANGE_CHANCE = 0.04;   // per-step chance a lit trailing glyph silently morphs (constant churn) -- lowered: fewer changes
+        const float MORPH_STEP = 0.45f;      // glyph-switch fade speed (1/frames) -- higher = quicker switch (raised: snappier swap)
         const float MORPH_DIP = 0.65f;       // how far a glyph dims at the switch midpoint (fade old out -> swap -> fade new in)
-        const double GLITCH_RATE = 0.0020;   // fraction of cells that change glyph WITH a flash (emphasis pops)
+        const double GLITCH_RATE = 0.0012;   // fraction of cells that change glyph WITH a flash (emphasis pops)
+        // Group morph: most changes are a single glyph, but a triggered morph sometimes takes a few
+        // CONTIGUOUS neighbors with it, so a small block switches at the same instant (not chunk-ONLY).
+        const double CHUNK_CHANCE = 0.15;    // share of triggered morphs that become a group instead of a single
+        const int CHUNK_MIN = 2, CHUNK_MAX = 6; // group length (rows) when a morph spreads
         const float FLASH_BOOST = 0.5f;      // momentary extra glow when a glyph changes/flips
         const float FLASH_DECAY = 0.45f;     // how fast that flash fades (low = brief); base tail fade is unchanged
         const double FLIP_RATE = 0.0015;     // fraction of cells mirrored horizontally per step
         const float FLIP_CHANCE = 0.28f;     // chance a freshly-lit glyph spawns mirrored
-        const double INTERRUPT_CHANCE = 0.0005; // per-step chance a whole column is wiped & restarted -- RARE (full-line removal)
+        const double INTERRUPT_CHANCE = 0.00004; // per-step chance a whole column is wiped INSTANTLY -- kept, but VERY rare (much rarer than a whole-line backspace); most line removal is the animated COLLAPSE below
+        // "Backspace" collapse: a standing line being deleted from its END (the bottom, the
+        // most-recently-written glyph) upward, one or two glyphs per step -- like holding
+        // backspace. Usually it stops at a random height (a section); rarely it takes the
+        // whole line (then the column restarts with a fresh head). This is the PRIMARY way
+        // lines are removed; the instant INTERRUPT_CHANCE above is the rare exception.
+        const double COLLAPSE_CHANCE = 0.020; // per-step chance a FROZEN (standing) column begins a backspace collapse (the PRIMARY deletion form); high so frozen lines don't sit static
+        const double COLLAPSE_FULL_FRAC = 0.12; // share of collapses that take the WHOLE line (rest stop at a random height)
+        const int COLLAPSE_MIN = 4, COLLAPSE_MAX = 30; // partial-collapse length in rows ("stops at a random height")
+        const int COLLAPSE_SPEED = 3;        // rows backspaced per step (the key-repeat cadence)
         // "being edited": each erase punches a gap of a RANDOM scale into a lit stream --
         // mostly a few stray characters, sometimes a segment, occasionally a long chunk
         // (a whole-column wipe is the separate INTERRUPT_CHANCE above).
-        const double SEG_ERASE_RATE = 0.12;  // erase attempts per step -- small-portion edits (kept modest so they don't strip standing lines)
+        const double SEG_ERASE_RATE = 0.12;  // erase attempts per step -- constant "editing" of every line (incl. still-falling ones), so lines don't pile up solid; backspace is how STANDING lines are removed
         const double SEG_SMALL_FRAC = 0.72;  // share of erases that nibble just a few chars
         const double SEG_MED_FRAC = 0.24;    // share that take out a mid-size segment (rest = long chunk)
         const int SEG_SMALL_MIN = 1, SEG_SMALL_MAX = 3;
@@ -223,12 +247,21 @@ namespace MatrixScreensaver
         const int SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 44;
         const double SPAWN_ON_ERASE = 0.15;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
         const double TOP_SPROUT_CHANCE = 0.30; // per-step chance to drop a fresh white head at the top of a bare-topped frozen column (refills the top; self-limits as the screen fills)
-        const int RESTART_GAP = 22;          // how far above the top a finished column restarts
-        const double FREEZE_CHANCE = 0.20;   // when a head reaches the bottom: chance the fallen line STAYS in place (frozen, still churning) instead of restarting -- raise for more, lower for fewer
+        const int RESTART_GAP = 60;          // how far above the top a finished column restarts -- larger = columns REST (dark, headless) longer between streams, so fewer heads fall at once and the field is less crowded
+        const double FREEZE_CHANCE = 0.30;   // when a head reaches the bottom: chance the fallen line STAYS in place (frozen) instead of cycling -- lowered so fewer lines sit static; SEG_ERASE keeps the cycling ones edited and backspace clears the frozen ones
         const double MID_FREEZE_CHANCE = 0.002; // per-step chance a still-FALLING line stops mid-screen and freezes in place
         const int MIN_FREEZE_LEN = 10;       // a line must have drawn at least this many chars before it may freeze (no 1-char freezes)
-        const float STAY_BRIGHT = 0.78f;     // brightness ceiling for a frozen line: it holds the glow it had, capped here (steady green, never a white head)
+        const float STAY_BRIGHT = BODY_BRIGHT; // frozen "standing code" holds at the same steady green as an active body (freeze is now only a lifecycle state, not a brightness)
         const int LEVELS = 48;               // brightness quantization for the glyph cache (smooth gradient)
+        // Eerie glow: a blurred, dimmed copy of the finished frame laid back over itself
+        // (cross-cell bloom). GLOW_STRENGTH is shared with wallpaper/matrix.html; the blur
+        // radius differs by engine (here a downscale factor keyed to cell size).
+        public const float GLOW_STRENGTH = 0.95f; // opacity of the blurred copy laid over the frame (used by MatrixForm's bloom); gives every glyph (the body too) a glow, not just the heads
+        // Dedicated HEAD glow: the body teal is nearly as luminous as the near-white head, so the
+        // general bloom can't make the head stand out. MatrixForm draws one smooth halo on each
+        // actively-falling head, positioned by its FRACTIONAL row so it glides (never strobes).
+        public const float HEAD_GLOW_RADIUS = 0.95f; // head-halo radius in CELLS -- tight, wraps the character (the crisp glyph is re-blit on top, so the halo shows as a ring hugging it)
+        public const float HEAD_GLOW_STRENGTH = 1.0f;// head-halo intensity (0 disables)
 
         public readonly Font Font;
         public readonly int CellW, CellH, Cols, Rows;
@@ -244,6 +277,7 @@ namespace MatrixScreensaver
         readonly int[] prevRow;
         readonly bool[] frozen;              // true = column has frozen into static code (set on reaching bottom)
         readonly int[] lit;                  // length of each column's current falling line (gates freezing)
+        readonly int[] collapse;             // rows left to backspace off a column's bottom (0 = not collapsing)
         // Secondary "regrowth" heads, spawned where code was just erased: they fall and
         // re-write the gap. A third way the rain is built, besides wrap-around restart
         // (head past the bottom) and post-wipe restart (INTERRUPT_CHANCE).
@@ -252,6 +286,9 @@ namespace MatrixScreensaver
         readonly Random rnd = new Random();
         readonly Bitmap[,] cache;            // [glyph, level]; level LEVELS == bright head
         readonly Bitmap[,] cacheFlipped;     // same, mirrored horizontally
+        readonly Bitmap[] glowCache;         // per-glyph GLYPH-SHAPED head-glow sprite (soft halo following the outline), transparent bg
+        readonly Bitmap[] glowCacheFlipped;  // same, mirrored
+        readonly int glowPad;                // halo padding around the glyph in a glow sprite
 
         static readonly char[] Glyphs = BuildGlyphs();
         static char[] BuildGlyphs()
@@ -264,6 +301,19 @@ namespace MatrixScreensaver
 
         int GlyphIdx() { return rnd.Next(Glyphs.Length); }
         float RandSpeed() { return SPEED_MIN + (float)rnd.NextDouble() * (SPEED_MAX - SPEED_MIN); }
+
+        // Color ramp from a brightness in [0,1]: TAIL -> BODY below the body floor, BODY ->
+        // near-white HEAD above it. Split at BODY_BRIGHT so a held body cell renders as COL_BODY.
+        static Color LevelColor(float bb)
+        {
+            int[] a, b; float t;
+            if (bb >= BODY_BRIGHT) { a = COL_BODY; b = COL_HEAD; t = (bb - BODY_BRIGHT) / (1f - BODY_BRIGHT); }
+            else { a = COL_TAIL; b = COL_BODY; t = bb / BODY_BRIGHT; }
+            return Color.FromArgb(
+                (int)(a[0] + (b[0] - a[0]) * t),
+                (int)(a[1] + (b[1] - a[1]) * t),
+                (int)(a[2] + (b[2] - a[2]) * t));
+        }
 
         // Weighted erase length: usually a few characters, sometimes a segment, rarely a long chunk.
         int SegLen()
@@ -298,6 +348,7 @@ namespace MatrixScreensaver
             prevRow = new int[Cols];
             frozen = new bool[Cols];
             lit = new int[Cols];
+            collapse = new int[Cols];
             for (int c = 0; c < Cols; c++)
             {
                 // Start every column above the top (staggered) so the rain cascades
@@ -318,12 +369,8 @@ namespace MatrixScreensaver
                     {
                         g.Clear(Color.Black);
                         g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                        // gradient: pure-white head -> matrix green -> black tail
-                        float bb = l / (float)LEVELS;
-                        int cr, cg, cb;
-                        if (bb >= 0.8f) { float t = (bb - 0.8f) / 0.2f; cr = (int)(255 * t); cg = 255; cb = (int)(70 + 185 * t); }
-                        else { float t = bb / 0.8f; cr = 0; cg = (int)(255 * t); cb = (int)(70 * t); }
-                        Color col = Color.FromArgb(cr, cg, cb);
+                        // gradient: near-white head -> teal-green body -> deep-teal tail
+                        Color col = LevelColor(l / (float)LEVELS);
                         using (SolidBrush br = new SolidBrush(col))
                             g.DrawString(Glyphs[gi].ToString(), Font, br, 0, 0, StringFormat.GenericTypographic);
                     }
@@ -339,6 +386,45 @@ namespace MatrixScreensaver
                     bm.RotateFlip(RotateFlipType.RotateNoneFlipX);
                     cacheFlipped[gi, l] = bm;
                 }
+
+            // Per-glyph GLYPH-SHAPED head-glow sprites: the glyph drawn in the teal glow color with a
+            // soft halo (blur via shrink+grow), on a transparent tile, so the head glow follows the
+            // character's outline (not a circle). Built once; the per-frame head glow is just a blit.
+            // The crisp glyph is re-blit on top, so the halo reads as a glyph-shaped glow around it.
+            glowPad = Math.Max(3, (int)(CellH * HEAD_GLOW_RADIUS));
+            int gw = CellW + glowPad * 2, gh = CellH + glowPad * 2;
+            int gd = Math.Max(2, glowPad / 2);                       // blur amount (shrink factor)
+            int gsw = Math.Max(1, gw / gd), gsh = Math.Max(1, gh / gd);
+            int ga = (int)(255 * HEAD_GLOW_STRENGTH); if (ga > 255) ga = 255; if (ga < 0) ga = 0;
+            glowCache = new Bitmap[Glyphs.Length];
+            glowCacheFlipped = new Bitmap[Glyphs.Length];
+            for (int gi = 0; gi < Glyphs.Length; gi++)
+            {
+                Bitmap spr = new Bitmap(gw, gh, PixelFormat.Format32bppArgb);
+                using (Bitmap tmp = new Bitmap(gw, gh, PixelFormat.Format32bppArgb))
+                {
+                    using (Graphics gt = Graphics.FromImage(tmp))
+                    {
+                        gt.TextRenderingHint = TextRenderingHint.AntiAlias;   // grayscale AA -> clean alpha on transparent
+                        using (SolidBrush br = new SolidBrush(Color.FromArgb(ga, COL_HEAD_GLOW[0], COL_HEAD_GLOW[1], COL_HEAD_GLOW[2])))
+                            gt.DrawString(Glyphs[gi].ToString(), Font, br, glowPad, glowPad, StringFormat.GenericTypographic);
+                    }
+                    using (Bitmap small = new Bitmap(gsw, gsh, PixelFormat.Format32bppArgb))
+                    {
+                        using (Graphics gs = Graphics.FromImage(small)) { gs.InterpolationMode = InterpolationMode.Bilinear; gs.DrawImage(tmp, 0, 0, gsw, gsh); }
+                        using (Graphics gp = Graphics.FromImage(spr))
+                        {
+                            gp.InterpolationMode = InterpolationMode.Bilinear;
+                            Rectangle dst = new Rectangle(0, 0, gw, gh);
+                            gp.DrawImage(small, dst, 0, 0, gsw, gsh, GraphicsUnit.Pixel);   // soft glyph-shaped halo...
+                            gp.DrawImage(small, dst, 0, 0, gsw, gsh, GraphicsUnit.Pixel);   // ...layered for strength
+                            gp.DrawImage(small, dst, 0, 0, gsw, gsh, GraphicsUnit.Pixel);
+                        }
+                    }
+                }
+                glowCache[gi] = spr;
+                Bitmap f = (Bitmap)spr.Clone(); f.RotateFlip(RotateFlipType.RotateNoneFlipX); glowCacheFlipped[gi] = f;
+            }
         }
 
         public Bitmap Tile(int glyphIdx, float b, bool flipped)
@@ -347,6 +433,16 @@ namespace MatrixScreensaver
             if (l < 0) l = 0; else if (l > LEVELS) l = LEVELS;
             return flipped ? cacheFlipped[glyphIdx, l] : cache[glyphIdx, l];
         }
+
+        public int GlowPad { get { return glowPad; } }
+        public Bitmap GlowTile(int glyphIdx, bool flipped) { return flipped ? glowCacheFlipped[glyphIdx] : glowCache[glyphIdx]; }
+
+        // Head-glow accessors: the leading falling-head row per column (fractional), and the
+        // regrowth sprouts -- so the renderer can lay a smooth halo at each active head.
+        public float HeadRow(int c) { return head[c]; }
+        public bool IsFrozen(int c) { return frozen[c]; }
+        public int SproutCount { get { return sprouts.Count; } }
+        public void SproutAt(int i, out int col, out float pos) { Sprout s = sprouts[i]; col = s.Col; pos = s.Pos; }
 
         // Glyph-switch fade: a transitioning cell dims toward MORPH_DIP at the swap midpoint, full at the ends.
         public float MorphDip(int idx)
@@ -358,25 +454,32 @@ namespace MatrixScreensaver
 
         public void Step()
         {
-            // Fade every cell a little. Frozen columns DON'T fade to black: a bright head
-            // settles down to STAY_BRIGHT and then holds, so the column stays as steady,
-            // still-churning code until it is edited away.
+            // NO fade-to-black: a bright head SETTLES down to the steady body brightness and
+            // then HOLDS there (no comet-tail). A cell goes dark only when it is erased,
+            // backspaced, interrupted, or restarted -- never by fading. Frozen and falling
+            // columns settle the same way; freeze is now only a lifecycle state.
             for (int c = 0; c < Cols; c++)
             {
-                bool fr = frozen[c];
                 int baseIdx = c * Rows;
                 for (int r = 0; r < Rows; r++)
                 {
                     int i = baseIdx + r;
-                    if (fr)
-                    {
-                        if (Bright[i] > STAY_BRIGHT) { Bright[i] *= DECAY; if (Bright[i] < STAY_BRIGHT) Bright[i] = STAY_BRIGHT; }
-                    }
-                    else if (Bright[i] > 0.001f) Bright[i] *= DECAY;
+                    if (Bright[i] > BODY_BRIGHT) { Bright[i] *= HEAD_SETTLE; if (Bright[i] < BODY_BRIGHT) Bright[i] = BODY_BRIGHT; }
                     if (Flash[i] > 0.001f) Flash[i] *= FLASH_DECAY; else Flash[i] = 0f;
                     // glyph churn with a soft fade: dim the old char out, swap at the dim point, fade the new in
                     if (morph[i] > 0f) { morph[i] -= MORPH_STEP; if (morph[i] <= 0.5f) Chars[i] = morphTo[i]; if (morph[i] < 0f) morph[i] = 0f; }
-                    else if (Bright[i] > 0.12f && rnd.NextDouble() < CHANGE_CHANCE) { morphTo[i] = GlyphIdx(); morph[i] = 1f; }
+                    else if (Bright[i] > 0.12f && rnd.NextDouble() < CHANGE_CHANCE)
+                    {
+                        // usually a single glyph; sometimes a contiguous group switches together. Spread
+                        // UPWARD (cells already visited this step) so the whole group shares phase 1.0 and
+                        // dips-swaps-rises in sync rather than rippling.
+                        int len = (rnd.NextDouble() < CHUNK_CHANCE) ? CHUNK_MIN + rnd.Next(CHUNK_MAX - CHUNK_MIN + 1) : 1;
+                        for (int k = 0; k < len && r - k >= 0; k++)
+                        {
+                            int j = baseIdx + r - k;
+                            if (Bright[j] > 0.12f && morph[j] <= 0f) { morphTo[j] = GlyphIdx(); morph[j] = 1f; }
+                        }
+                    }
                 }
             }
 
@@ -385,9 +488,32 @@ namespace MatrixScreensaver
                 int baseIdx = c * Rows;
                 if (frozen[c])
                 {
-                    // Frozen column: stays as static churning code until an interrupt edits it away
-                    // (now rare), then a fresh head falls from the top to re-write the lost line of code.
-                    if (rnd.NextDouble() < INTERRUPT_CHANCE)
+                    // A standing line can be BACKSPACED away from its TRAILING end (the TOP) downward,
+                    // leaving the leading/head end for last -- or, far more rarely, wiped instantly.
+                    // Either way, once it's empty a fresh head falls from the top to re-write the line.
+                    if (collapse[c] <= 0 && rnd.NextDouble() < COLLAPSE_CHANCE)
+                        collapse[c] = (rnd.NextDouble() < COLLAPSE_FULL_FRAC)
+                            ? Rows                                                  // whole line
+                            : (COLLAPSE_MIN + rnd.Next(COLLAPSE_MAX - COLLAPSE_MIN + 1)); // stop at a random height
+                    if (collapse[c] > 0)
+                    {
+                        int removed = 0;
+                        for (int r = 0; r < Rows && removed < COLLAPSE_SPEED && collapse[c] > 0; r++)
+                        {
+                            int idx = baseIdx + r;
+                            if (Bright[idx] > 0.001f) { Bright[idx] = 0f; Flash[idx] = 0f; morph[idx] = 0f; removed++; collapse[c]--; }
+                        }
+                        if (removed == 0)   // nothing left to delete -> the line is gone: restart from the top
+                        {
+                            collapse[c] = 0;
+                            frozen[c] = false;
+                            head[c] = -rnd.Next(RESTART_GAP);
+                            prevRow[c] = (int)Math.Floor(head[c]);
+                            speed[c] = RandSpeed();
+                            lit[c] = 0;
+                        }
+                    }
+                    else if (rnd.NextDouble() < INTERRUPT_CHANCE)
                     {
                         for (int r = 0; r < Rows; r++) { Bright[baseIdx + r] = 0f; Flash[baseIdx + r] = 0f; }
                         frozen[c] = false;
@@ -568,6 +694,9 @@ namespace MatrixScreensaver
         Rectangle initialBounds;
         Bitmap buffer;
         Graphics gBuf;
+        Bitmap bloomSmall;         // downscaled scratch for the glow pass (blur via shrink+grow)
+        Graphics gSmall;
+        ImageAttributes bloomAttrs; // alpha-scales the blurred copy laid back over the frame
         bool armed;
         bool lockOnExit;           // /lock mode: lock the workstation when dismissed
         Point armCursor;
@@ -656,10 +785,27 @@ namespace MatrixScreensaver
             int w = Math.Max(1, ClientSize.Width), h = Math.Max(1, ClientSize.Height);
             if (buffer != null) buffer.Dispose();
             if (gBuf != null) gBuf.Dispose();
+            if (gSmall != null) gSmall.Dispose();
+            if (bloomSmall != null) bloomSmall.Dispose();
             buffer = new Bitmap(w, h);
             gBuf = Graphics.FromImage(buffer);
             gBuf.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+            gBuf.InterpolationMode = InterpolationMode.Bilinear; // smooths the glow upscale (unscaled glyph blits are unaffected)
             gBuf.Clear(Color.Black);
+
+            // Glow scratch: shrink the frame by ~third-cell then grow it back == a cheap, wide blur.
+            int d = Math.Max(2, field.CellH / 3);
+            bloomSmall = new Bitmap(Math.Max(1, w / d), Math.Max(1, h / d));
+            gSmall = Graphics.FromImage(bloomSmall);
+            gSmall.InterpolationMode = InterpolationMode.Bilinear; // averaging on the shrink is what blurs
+            if (bloomAttrs == null)
+            {
+                ColorMatrix cm = new ColorMatrix();
+                cm.Matrix33 = RainField.GLOW_STRENGTH;             // alpha-scale the blurred copy laid back over the frame
+                bloomAttrs = new ImageAttributes();
+                bloomAttrs.SetColorMatrix(cm);
+            }
+            // (Head-glow sprites are GLYPH-SHAPED and built once in RainField, shared across windows.)
         }
 
         // Called by the controller each tick: clear, then blit this window's slice
@@ -671,7 +817,25 @@ namespace MatrixScreensaver
 
             int W = buffer.Width, H = buffer.Height;
             gBuf.Clear(Color.Black);
+            BlitCells();
 
+            // Eerie glow (cross-cell bloom): blur a shrunk copy of the frame, lay it back over the
+            // frame strongly, then RE-BLIT the crisp glyphs on top. The glyphs stay sharp (opaque
+            // tiles overwrite the wash within their own cell) while the halo survives in the dark
+            // cells around lit code.
+            gSmall.DrawImage(buffer, 0, 0, bloomSmall.Width, bloomSmall.Height);
+            gBuf.DrawImage(bloomSmall, new Rectangle(0, 0, W, H), 0, 0, bloomSmall.Width, bloomSmall.Height, GraphicsUnit.Pixel, bloomAttrs);
+
+            DrawHeadGlows();   // smooth halo on each falling head (under the crisp glyphs)
+            BlitCells();       // re-blit crisp glyphs on top of the bloom + head halos
+
+            Invalidate();
+        }
+
+        // Blit this window's slice of the shared field (only lit cells) into the back buffer.
+        void BlitCells()
+        {
+            int W = buffer.Width, H = buffer.Height;
             int cStart = Math.Max(0, offsetX / field.CellW - 1);
             int cEnd = Math.Min(field.Cols - 1, (offsetX + W) / field.CellW + 1);
             int rStart = Math.Max(0, offsetY / field.CellH - 1);
@@ -691,8 +855,36 @@ namespace MatrixScreensaver
                     gBuf.DrawImageUnscaled(field.Tile(field.Chars[idx], b, field.Flip[idx]), lx, r * field.CellH - offsetY);
                 }
             }
+        }
 
-            Invalidate();
+        // A GLYPH-SHAPED glow on each actively-falling head (+ regrowth sprouts): blit the matching
+        // glyph's prebaked glow sprite at the head's cell, so the halo follows the character (not a
+        // circle). The crisp glyph is re-blit on top afterward. Frozen lines have no head -> none.
+        void DrawHeadGlows()
+        {
+            int pad = field.GlowPad, W = buffer.Width, H = buffer.Height;
+            for (int c = 0; c < field.Cols; c++)
+            {
+                if (field.IsFrozen(c)) continue;
+                float hp = field.HeadRow(c);
+                if (hp < 0f || hp >= field.Rows) continue;
+                BlitHeadGlow(c, (int)hp, pad, W, H);
+            }
+            for (int i = 0; i < field.SproutCount; i++)
+            {
+                int col; float pos; field.SproutAt(i, out col, out pos);
+                if (pos < 0f || pos >= field.Rows) continue;
+                BlitHeadGlow(col, (int)pos, pad, W, H);
+            }
+        }
+
+        void BlitHeadGlow(int c, int row, int pad, int W, int H)
+        {
+            int idx = c * field.Rows + row;
+            Bitmap spr = field.GlowTile(field.Chars[idx], field.Flip[idx]);
+            int x = c * field.CellW - offsetX - pad, y = row * field.CellH - offsetY - pad;
+            if (x > W || y > H || x + spr.Width < 0 || y + spr.Height < 0) return;   // offscreen for this window's slice
+            gBuf.DrawImage(spr, x, y, spr.Width, spr.Height);
         }
 
         protected override void OnPaint(PaintEventArgs e)
