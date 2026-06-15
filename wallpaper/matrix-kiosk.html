@@ -39,52 +39,39 @@
   const FRAME_MS   = 50;     // higher = slower animation (~20 fps)
   const SPEED_MIN  = 0.30;   // rows advanced per frame (lower = slower fall)
   const SPEED_MAX  = 0.70;
-  // NO FADE: a lit cell does NOT decay to black -- a fresh head settles to the steady body
-  // brightness and HOLDS there. Columns clear only via erases / collapses / interrupts.
-  const BODY_BRIGHT = 0.62;   // steady green a lit cell holds at (== the color-ramp split)
-  const HEAD_SETTLE = 0.80;   // per-frame multiplier above BODY_BRIGHT -> taller (~3-cell) bright head, easier to pick out
+  // NO FADE, UNIFORM BODY: a lit cell does NOT decay -- the single head cell is full-bright and
+  // every other lit cell holds at the SAME body brightness (no settle gradient, flash or dim).
+  // Columns clear only via the animated backspace / instant gap erases.
+  const BODY_BRIGHT = 0.62;   // steady green EVERY lit body cell holds at (== the color-ramp split); the head alone sits brighter at 1.0
   // Green-blue (teal-leaning) ramp with a near-white -- not pure white -- head. [r,g,b]
   const COL_TAIL = [0, 25, 18];     // deep teal, only seen briefly as a cell clears
   const COL_BODY = [0, 235, 140];   // steady Matrix green (blue-leaning vs the old 0,255,70)
   const COL_HEAD = [235, 255, 250]; // near-white mint head (bright, but not 255,255,255)
-  const FLASH_BOOST = 0.5;    // momentary extra glow when a glyph changes/flips
-  const FLASH_DECAY = 0.45;   // how fast that flash fades (low = brief); base tail fade unchanged
-  const CHANGE_CHANCE = 0.04; // per-frame chance a lit trailing glyph silently morphs (constant churn) -- lowered: fewer changes
-  const MORPH_STEP = 0.45;    // glyph-switch fade speed (1/frames) -- higher = quicker switch (raised: snappier swap)
-  const MORPH_DIP  = 0.65;    // how far a glyph dims at the switch midpoint (fade old out -> swap -> fade new in)
-  const GLITCH_RATE = 0.0012; // fraction of cells that change glyph WITH a flash (emphasis)
-  // Group morph: most changes are a single glyph, but a triggered morph sometimes takes a few
+  const CHANGE_CHANCE = 0.04; // per-frame chance a lit glyph INSTANTLY swaps to another (constant churn; no fade/dim now)
+  // Group change: most swaps are a single glyph, but a triggered change sometimes takes a few
   // CONTIGUOUS neighbors with it, so a small block switches at the same instant (not chunk-ONLY).
-  const CHUNK_CHANCE = 0.15;  // share of triggered morphs that become a group instead of a single
-  const CHUNK_MIN = 2, CHUNK_MAX = 6; // group length (rows) when a morph spreads
+  const CHUNK_CHANCE = 0.15;  // share of triggered changes that become a group instead of a single
+  const CHUNK_MIN = 2, CHUNK_MAX = 6; // group length (rows) when a change spreads
   const FLIP_RATE   = 0.0015; // fraction of cells mirrored horizontally per frame
   const FLIP_CHANCE = 0.28;   // chance a freshly-lit glyph spawns mirrored
-  const INTERRUPT_CHANCE = 0.00004; // per-frame chance a whole column is wiped INSTANTLY -- kept, but VERY rare (much rarer than a whole-line backspace); most line removal is the animated COLLAPSE below
-  // "Backspace" collapse: a standing line being deleted from its END (the bottom, the most-
-  // recently-written glyph) upward, one or two glyphs per frame -- like holding backspace.
-  // Usually it stops at a random height (a section); rarely it takes the whole line (then the
-  // column restarts). This is the PRIMARY way lines are removed; INTERRUPT is the rare exception.
-  const COLLAPSE_CHANCE = 0.020; // per-frame chance a FROZEN (standing) column begins a backspace collapse (the PRIMARY deletion form); high so frozen lines don't sit static
-  const COLLAPSE_FULL_FRAC = 0.12; // share of collapses that take the WHOLE line (rest stop at a random height)
-  const COLLAPSE_MIN = 4, COLLAPSE_MAX = 30; // partial-collapse length in rows ("stops at a random height")
-  const COLLAPSE_SPEED = 3;   // rows backspaced per frame (the key-repeat cadence)
-  // "being edited": each erase punches a gap of a RANDOM scale into a lit stream --
-  // mostly a few stray characters, sometimes a segment, occasionally a long chunk
-  // (a whole-column wipe is the separate INTERRUPT_CHANCE above).
-  const SEG_ERASE_RATE = 0.12;  // erase attempts per frame -- constant "editing" of every line (incl. still-falling ones), so lines don't pile up solid; backspace is how STANDING lines are removed
-  const SEG_SMALL_FRAC = 0.72;  // share of erases that nibble just a few chars
-  const SEG_MED_FRAC = 0.24;    // share that take out a mid-size segment (rest = long chunk)
+  // ANIMATED BACKSPACE (primary deletion): an erase can start ANYWHERE on a lit line and eats
+  // characters one at a time DOWNWARD through the rest of the line, at a fraction of the column's
+  // head speed ("at the head speed or slower"). Replaces the old whole-line collapse and INTERRUPT.
+  const ERASE_CHANCE = 0.05; // per-frame chance a column with lit cells begins a new animated backspace (main lever for how long standing code lingers)
+  const ERASE_SPEED_MIN_FRAC = 0.7; // slowest backspace = this fraction of the column's head speed
+  const ERASE_SPEED_MAX_FRAC = 1.0; // fastest backspace = head speed (never faster)
+  // Instant small/medium gap "editing" so lines don't pile up solid (the old long-chunk tier is gone).
+  const SEG_ERASE_RATE = 0.12;  // instant-erase attempts per frame -- constant small "editing" of every line
+  const SEG_SMALL_FRAC = 0.72;  // share of instant erases that nibble just a few chars (rest = a mid-size segment)
   const SEG_SMALL_MIN = 1, SEG_SMALL_MAX = 3;
   const SEG_MED_MIN = 5, SEG_MED_MAX = 18;
-  const SEG_LARGE_MIN = 28, SEG_LARGE_MAX = 44;
-  const SPAWN_ON_ERASE = 0.15;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
-  const TOP_SPROUT_CHANCE = 0.30; // per-frame chance to drop a fresh white head at the top of a bare-topped frozen column (refills the top; self-limits as the screen fills)
-  const RESTART_GAP = 60;     // how far above the top a finished column restarts -- larger = columns REST (dark, headless) longer between streams, so fewer heads fall at once and the field is less crowded
-  const FREEZE_CHANCE = 0.30; // when a head reaches the bottom: chance the fallen line STAYS in place
+  const SPAWN_ON_ERASE = 0.08;  // chance an erase also seeds a NEW falling head at the gap (a third way streams are built)
+  const TOP_SPROUT_CHANCE = 0.02; // per-frame chance to drop a fresh white head at the top of a bare-topped frozen column (refills the top; self-limits as the screen fills)
+  const RESTART_GAP = 110;     // how far above the top a finished column restarts -- larger = columns REST (dark, headless) longer between streams, so fewer heads fall at once and the field is less crowded
+  const FREEZE_CHANCE = 1.0; // when a head reaches the bottom: chance the fallen line STAYS in place
                               //   (frozen, still churning) instead of restarting -- raise for more, lower for fewer
   const MID_FREEZE_CHANCE = 0.002; // per-frame chance a still-FALLING line stops mid-screen and freezes in place
   const MIN_FREEZE_LEN = 10;  // a line must have drawn at least this many chars before it may freeze (no 1-char freezes)
-  const STAY_BRIGHT = BODY_BRIGHT; // frozen "standing code" holds at the same steady green as an active body (freeze is now only a lifecycle state)
   // ---- kiosk/platform tunables -----------------------------------------
   const GRID_DIV   = 32;     // glyph rows across the SHORT screen edge (higher = smaller, denser rain). 32 (was
                              // 48) ~halves the cell count -- the direct-fillText path cost scales with the number
@@ -131,16 +118,16 @@
   const glyphChars = [];
   for (let _gi = 0; _gi < codes.length; _gi++) glyphChars.push(String.fromCharCode(codes[_gi]));
 
-  // Weighted erase length: usually a few characters, sometimes a segment, rarely a long chunk.
+  // Weighted erase length: usually just a few characters, sometimes a mid-size segment.
+  // (The old long-chunk tier is gone -- big removals are no longer instant.)
   function segLen() {
-    const t = Math.random();
-    if (t < SEG_SMALL_FRAC) return SEG_SMALL_MIN + ((Math.random() * (SEG_SMALL_MAX - SEG_SMALL_MIN + 1)) | 0);
-    if (t < SEG_SMALL_FRAC + SEG_MED_FRAC) return SEG_MED_MIN + ((Math.random() * (SEG_MED_MAX - SEG_MED_MIN + 1)) | 0);
-    return SEG_LARGE_MIN + ((Math.random() * (SEG_LARGE_MAX - SEG_LARGE_MIN + 1)) | 0);
+    if (Math.random() < SEG_SMALL_FRAC) return SEG_SMALL_MIN + ((Math.random() * (SEG_SMALL_MAX - SEG_SMALL_MIN + 1)) | 0);
+    return SEG_MED_MIN + ((Math.random() * (SEG_MED_MAX - SEG_MED_MIN + 1)) | 0);
   }
 
   let W, H, fontSize, cellW, cellH, cols, rows, fontStr;
-  let bright, chars, flip, flash, head, speed, prevRow, sprouts, frozen, lit, morph, morphTo, collapse;
+  let bright, chars, flip, head, speed, prevRow, sprouts, frozen, lit;
+  let eraseActive, erasePos, eraseRemaining, eraseSpeed;   // animated backspace state, per column
   let atlas, atlasFlip, atlasLevels = 0, atlasPerRow = 0;   // sprite-sheets + baked level count + glyph-tiles per atlas row (0 levels = atlas unavailable)
 
   // Same gradient as the live render path (and src/Matrix.cs): near-white mint head ->
@@ -274,16 +261,16 @@
     bright  = new Float32Array(cols * rows);
     chars   = new Uint16Array(cols * rows);
     flip    = new Uint8Array(cols * rows);
-    flash   = new Float32Array(cols * rows);
-    morph   = new Float32Array(cols * rows);  // per-cell glyph-switch fade phase (1 -> 0; 0 = none)
-    morphTo = new Uint16Array(cols * rows);   // pending glyph index to swap to at the fade midpoint
     head    = new Float32Array(cols);
     speed   = new Float32Array(cols);
     prevRow = new Int32Array(cols);
     sprouts = [];   // secondary heads spawned where code was erased (reset on resize)
     frozen  = new Uint8Array(cols);   // 1 = column has frozen into static code (set on reaching bottom)
     lit     = new Int32Array(cols);   // length of each column's current falling line (gates freezing)
-    collapse = new Int32Array(cols);  // rows left to backspace off a column's bottom (0 = not collapsing)
+    eraseActive    = new Uint8Array(cols);   // 1 = an animated backspace is in progress in this column
+    erasePos       = new Float32Array(cols); // fractional row the backspace is eating at (advances downward)
+    eraseRemaining = new Int32Array(cols);   // characters still to remove in the current backspace
+    eraseSpeed     = new Float32Array(cols); // rows/frame for this backspace (a fraction of the head speed)
     for (let c = 0; c < cols; c++) {
       head[c] = -Math.random() * rows;
       speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
@@ -302,68 +289,31 @@
   resize();
 
   function step() {
-    // 1) NO fade-to-black: a bright head SETTLES to the steady body brightness and then HOLDS
-    //    there (no comet-tail). A cell goes dark only when erased / backspaced / interrupted /
-    //    restarted. Frozen and falling columns settle the same way (freeze is just lifecycle).
+    // 1) UNIFORM BODY, NO FADE: every lit cell snaps to BODY_BRIGHT (the head re-asserts itself to
+    //    1.0 in the lifecycle pass below). Glyph changes are INSTANT -- no morph fade, no dim, no flash.
     for (let c = 0; c < cols; c++) {
       const base = c * rows;
       for (let r = 0; r < rows; r++) {
         const i = base + r;
-        if (bright[i] > BODY_BRIGHT) { bright[i] *= HEAD_SETTLE; if (bright[i] < BODY_BRIGHT) bright[i] = BODY_BRIGHT; }
-        flash[i] = (flash[i] > 0.001) ? flash[i] * FLASH_DECAY : 0;
-        // glyph churn with a soft fade: dim the old char out, swap at the dim point, fade the new in
-        if (morph[i] > 0) {
-          morph[i] -= MORPH_STEP;
-          if (morph[i] <= 0.5) chars[i] = morphTo[i];
-          if (morph[i] < 0) morph[i] = 0;
-        } else if (bright[i] > 0.12 && Math.random() < CHANGE_CHANCE) {
-          // usually a single glyph; sometimes a contiguous group switches together. Spread UPWARD
-          // (cells already visited this step) so the group shares phase 1.0 and swaps in sync.
+        if (bright[i] > BODY_BRIGHT) bright[i] = BODY_BRIGHT;   // instant settle -> uniform body
+        if (bright[i] > 0.12 && Math.random() < CHANGE_CHANCE) {
+          // usually a single glyph; sometimes a contiguous group switches together (upward, over
+          // cells already visited this step) -- an INSTANT swap, no fade.
           const len = (Math.random() < CHUNK_CHANCE) ? (CHUNK_MIN + ((Math.random() * (CHUNK_MAX - CHUNK_MIN + 1)) | 0)) : 1;
           for (let k = 0; k < len && r - k >= 0; k++) {
             const j = base + r - k;
-            if (bright[j] > 0.12 && morph[j] <= 0) { morphTo[j] = code(); morph[j] = 1.0; }
+            if (bright[j] > 0.12) chars[j] = code();
           }
         }
       }
     }
 
-    // 2) advance each column's head, lighting new cells with fresh glyphs.
+    // 2) Falling columns: advance the head, write the trail at BODY_BRIGHT, and hold the single
+    //    head cell full-bright. At the bottom a long-enough line may FREEZE (stand) to be
+    //    backspaced; else it restarts. Frozen columns don't advance.
     for (let c = 0; c < cols; c++) {
+      if (frozen[c]) continue;
       const base = c * rows;
-      if (frozen[c]) {
-        // A standing line can be BACKSPACED away from its TRAILING end (the TOP) downward, leaving
-        // the leading/head end for last -- or, far more rarely, wiped instantly. Either way, once
-        // it's empty a fresh head falls from the top to re-write the line.
-        if (collapse[c] <= 0 && Math.random() < COLLAPSE_CHANCE) {
-          collapse[c] = (Math.random() < COLLAPSE_FULL_FRAC)
-            ? rows                                                              // whole line
-            : (COLLAPSE_MIN + ((Math.random() * (COLLAPSE_MAX - COLLAPSE_MIN + 1)) | 0)); // stop at a random height
-        }
-        if (collapse[c] > 0) {
-          let removed = 0;
-          for (let r = 0; r < rows && removed < COLLAPSE_SPEED && collapse[c] > 0; r++) {
-            const idx = base + r;
-            if (bright[idx] > 0.001) { bright[idx] = 0; flash[idx] = 0; morph[idx] = 0; removed++; collapse[c]--; }
-          }
-          if (removed === 0) {   // nothing left to delete -> the line is gone: restart from the top
-            collapse[c] = 0;
-            frozen[c] = 0;
-            head[c] = -((Math.random() * RESTART_GAP) | 0);
-            prevRow[c] = Math.floor(head[c]);
-            speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
-            lit[c] = 0;
-          }
-        } else if (Math.random() < INTERRUPT_CHANCE) {
-          for (let r = 0; r < rows; r++) { bright[base + r] = 0; flash[base + r] = 0; }
-          frozen[c] = 0;
-          head[c] = -((Math.random() * RESTART_GAP) | 0);
-          prevRow[c] = Math.floor(head[c]);
-          speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
-          lit[c] = 0;
-        }
-        continue;
-      }
       head[c] += speed[c];
       const nr = Math.floor(head[c]);
       if (nr !== prevRow[c]) {
@@ -372,55 +322,56 @@
             const idx = base + r;
             chars[idx] = code();
             flip[idx] = (Math.random() < FLIP_CHANCE) ? 1 : 0;
-            bright[idx] = 1.0;
+            bright[idx] = BODY_BRIGHT;
             lit[c]++;   // grow this line's length -- gates freezing so short stubs can't stay
           }
         }
         prevRow[c] = nr;
       }
+      if (nr >= 0 && nr < rows) bright[base + nr] = 1.0;   // the head cell alone holds full-bright
+
       if (head[c] > rows + 6) {
-        // only a long-enough line may stay; short ones just restart from the top
-        if (lit[c] >= MIN_FREEZE_LEN && Math.random() < FREEZE_CHANCE) {
-          // reached the bottom -> the fallen line STAYS as-is: no relight, no new head. It
-          // holds the code it already drew and keeps churning until an interrupt edits it away.
-          frozen[c] = 1;
-        } else {
-          head[c] = -((Math.random() * RESTART_GAP) | 0);
-          prevRow[c] = Math.floor(head[c]);
-          speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
-          lit[c] = 0;
-        }
+        if (lit[c] >= MIN_FREEZE_LEN && Math.random() < FREEZE_CHANCE) frozen[c] = 1; // stand, to be backspaced
+        else restartColumn(c);
       } else if (lit[c] >= MIN_FREEZE_LEN && Math.random() < MID_FREEZE_CHANCE) {
-        // a long-enough still-falling line can stop mid-screen and freeze in place, holding the
-        // code it has drawn so far and churning -- just like a line that reached the bottom.
-        frozen[c] = 1;
-      } else if (Math.random() < INTERRUPT_CHANCE) {
-        // "being edited" (rare): wipe this whole stream, then replace it -- half the time a
-        // fresh stream from the top (renewal), half a mid-screen reappearance (edit).
-        for (let r = 0; r < rows; r++) { const idx = base + r; bright[idx] = 0; flash[idx] = 0; }
-        head[c] = (Math.random() < 0.5) ? -Math.random() * RESTART_GAP : Math.random() * rows;
-        prevRow[c] = Math.floor(head[c]);
-        speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
-        lit[c] = 0;
+        frozen[c] = 1; // a still-falling line can stop mid-screen and stand
       }
     }
 
-    // 3) flicker: change a few random lit cells to a new glyph (authentic churn)
-    const glitches = Math.max(1, (cols * rows * GLITCH_RATE) | 0);
-    for (let k = 0; k < glitches; k++) {
-      const idx = (Math.random() * bright.length) | 0;
-      if (bright[idx] > 0.15) { chars[idx] = code(); flash[idx] = FLASH_BOOST; }
+    // 2b) ANIMATED BACKSPACE (primary deletion): a backspace can begin ANYWHERE on a lit line and
+    //     eats characters one at a time DOWNWARD, at a fraction of the column's head speed. It runs
+    //     on falling and frozen columns alike; a frozen column fully cleared recycles from the top.
+    for (let c = 0; c < cols; c++) {
+      const base = c * rows;
+      if (!eraseActive[c] && Math.random() < ERASE_CHANCE) {
+        const start = pickLitRow(c);
+        if (start >= 0) {
+          eraseActive[c] = 1;
+          erasePos[c] = start;
+          eraseRemaining[c] = rows;   // eat from the start point down through the rest of the line
+          eraseSpeed[c] = speed[c] * (ERASE_SPEED_MIN_FRAC + Math.random() * (ERASE_SPEED_MAX_FRAC - ERASE_SPEED_MIN_FRAC));
+        }
+      }
+      if (eraseActive[c]) {
+        const from = Math.floor(erasePos[c]);
+        erasePos[c] += eraseSpeed[c];
+        const to = Math.floor(erasePos[c]);
+        for (let r = from; r <= to && eraseRemaining[c] > 0; r++) {
+          if (r >= 0 && r < rows && bright[base + r] > 0.001) { bright[base + r] = 0; eraseRemaining[c]--; }
+        }
+        if (eraseRemaining[c] <= 0 || erasePos[c] >= rows) eraseActive[c] = 0;
+      }
+      if (frozen[c] && !eraseActive[c] && columnEmpty(c)) restartColumn(c);
     }
 
-    // 4) ...and mirror a few other random lit cells horizontally
+    // 3) mirror a few random lit cells horizontally (kept churn; no flash now)
     const flips = Math.max(1, (cols * rows * FLIP_RATE) | 0);
     for (let k = 0; k < flips; k++) {
       const idx = (Math.random() * bright.length) | 0;
-      if (bright[idx] > 0.15) { flip[idx] ^= 1; flash[idx] = FLASH_BOOST; }
+      if (bright[idx] > 0.15) flip[idx] ^= 1;
     }
 
-    // 6) ...and punch random-scale gaps into random lit streams ("sections taken out"):
-    //    a few stray characters, a mid-size segment, or a long chunk -- see segLen()
+    // 4) instant small/medium gap "editing" so lines don't pile up solid (no long-chunk tier now)
     const segErases = Math.max(1, (cols * SEG_ERASE_RATE) | 0);
     for (let k = 0; k < segErases; k++) {
       const idx = (Math.random() * bright.length) | 0;
@@ -428,9 +379,8 @@
         const base = ((idx / rows) | 0) * rows;
         const r0 = idx % rows;
         const len = segLen();
-        for (let r = r0; r < r0 + len && r < rows; r++) { bright[base + r] = 0; flash[base + r] = 0; }
-        // ...and sometimes regrow: drop a fresh head in at the top of the gap so a NEW
-        // stream re-writes where code was just removed (third build path).
+        for (let r = r0; r < r0 + len && r < rows; r++) bright[base + r] = 0;
+        // ...and sometimes regrow: drop a fresh head at the top of the gap so a NEW stream re-writes it
         if (sprouts.length < cols && Math.random() < SPAWN_ON_ERASE) {
           chars[base + r0] = code(); flip[base + r0] = (Math.random() < FLIP_CHANCE) ? 1 : 0; bright[base + r0] = 1.0;
           sprouts.push({ col: (idx / rows) | 0, pos: r0, speed: SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN), prev: r0 });
@@ -438,9 +388,8 @@
       }
     }
 
-    // 6b) keep the TOP from going bare: occasionally drop a fresh white head at the top of a
-    //     frozen column whose top has faded out. It falls and re-lights the column, meeting /
-    //     overwriting the standing line below (which holds at STAY_BRIGHT as the head passes).
+    // 5) keep the TOP from going bare: occasionally drop a fresh head at the top of a frozen
+    //    column whose top has cleared. It falls and re-lights the column.
     if (sprouts.length < cols && Math.random() < TOP_SPROUT_CHANCE) {
       const col = (Math.random() * cols) | 0;
       if (frozen[col] && bright[col * rows] < 0.3) {
@@ -450,7 +399,7 @@
       }
     }
 
-    // 7) advance those regrowth heads like the main heads, dropping them off the bottom
+    // 6) advance those regrowth heads like the main heads: trail at BODY_BRIGHT, head full-bright
     for (let s = sprouts.length - 1; s >= 0; s--) {
       const sp = sprouts[s];
       sp.pos += sp.speed;
@@ -461,13 +410,41 @@
           if (r >= 0 && r < rows) {
             chars[b + r] = code();
             flip[b + r] = (Math.random() < FLIP_CHANCE) ? 1 : 0;
-            bright[b + r] = 1.0;
+            bright[b + r] = BODY_BRIGHT;
           }
         }
         sp.prev = nr;
       }
+      if (nr >= 0 && nr < rows) bright[sp.col * rows + nr] = 1.0;   // sprout head full-bright
       if (sp.pos > rows + 6) sprouts.splice(s, 1);
     }
+  }
+
+  function restartColumn(c) {
+    frozen[c] = 0;
+    eraseActive[c] = 0;
+    head[c] = -((Math.random() * RESTART_GAP) | 0);
+    prevRow[c] = Math.floor(head[c]);
+    speed[c] = SPEED_MIN + Math.random() * (SPEED_MAX - SPEED_MIN);
+    lit[c] = 0;
+  }
+
+  // A random LIT row in column c (scanning from a random offset), or -1 if none -- so a
+  // backspace can begin "anywhere on the line".
+  function pickLitRow(c) {
+    const base = c * rows;
+    const r0 = (Math.random() * rows) | 0;
+    for (let k = 0; k < rows; k++) {
+      let r = r0 + k; if (r >= rows) r -= rows;
+      if (bright[base + r] > 0.12) return r;
+    }
+    return -1;
+  }
+
+  function columnEmpty(c) {
+    const base = c * rows;
+    for (let r = 0; r < rows; r++) if (bright[base + r] > 0.001) return false;
+    return true;
   }
 
   function render() {
@@ -482,10 +459,8 @@
         const base = c * rows;
         for (let r = 0; r < rows; r++) {
           const i = base + r;
-          let b = bright[i] + flash[i];
+          const b = bright[i];                         // only ever 0, BODY_BRIGHT, or 1.0 now
           if (b <= 0.04) continue;
-          if (morph[i] > 0) b *= 1 - MORPH_DIP * (1 - Math.abs(morph[i] * 2 - 1)); // soft fade on glyph switch
-          if (b > 1) b = 1;                            // clamp BEFORE quantizing (flash can push b > 1)
           let lvl = (b * atlasLevels + 0.5) | 0;       // round to nearest baked level
           if (lvl > atlasLevels) lvl = atlasLevels;
           const ti = chars[i] * nLevels + lvl;
@@ -507,10 +482,8 @@
       const base = c * rows;
       for (let r = 0; r < rows; r++) {
         const i = base + r;
-        let b = bright[i] + flash[i];
+        const b = bright[i];                 // only ever 0, BODY_BRIGHT, or 1.0 now
         if (b <= 0.04) continue;
-        if (morph[i] > 0) b *= 1 - MORPH_DIP * (1 - Math.abs(morph[i] * 2 - 1));
-        if (b > 1) b = 1;
         let lvl = (b * (PALETTE_N - 1) + 0.5) | 0;          // quantize to the cached palette
         ctx.fillStyle = palette[lvl];                       // reused string -- no per-cell color build/GC
         const ch = glyphChars[chars[i]];                    // prebuilt glyph string (no per-cell fromCharCode)
